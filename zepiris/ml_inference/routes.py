@@ -18,6 +18,7 @@ from zepiris.ml_inference.deps import (
 )
 from zepiris.schemas.ml_inference import (
     BlurDetectionResult,
+    FaceDetectionResult,
     FaceEmbeddingResult,
     ImageQualityAssessmentResult,
     NSFWDetectionResult,
@@ -110,6 +111,16 @@ def embed_face(
     """Generate face embedding from an image."""
     image_rgb = _decode_base64_image(payload.image_b64)
     return service.embed(image_rgb)
+
+
+@router.post("/v1/face/detect", response_model=FaceDetectionResult)
+def detect_face(
+    service: FaceEmbeddingDep,
+    payload: ImagePayload,
+) -> FaceDetectionResult:
+    """Detect the primary face and return its normalized bounding box (no recognition)."""
+    image_rgb = _decode_base64_image(payload.image_b64)
+    return service.detect_box(image_rgb)
 
 
 @router.post("/v1/iqa/assess", response_model=ImageQualityAssessmentResult)

@@ -5,16 +5,11 @@ from fastapi import Depends, Request
 from zepiris.config import Settings, get_settings
 from zepiris.services.embedding import FaceEmbeddingProvider
 from zepiris.services.iqa import MLInferenceIQAService
-from zepiris.services.milvus_store import MilvusFaceStore
-from zepiris.services.minio_storage import MinioStorageService
+from zepiris.services.s3_fetcher import S3ImageFetcher
 
 
 def settings_dep() -> Settings:
     return get_settings()
-
-
-def minio_dep(request: Request) -> MinioStorageService:
-    return request.app.state.minio_storage
 
 
 def iqa_dep(request: Request) -> MLInferenceIQAService:
@@ -25,12 +20,11 @@ def embedding_dep(request: Request) -> FaceEmbeddingProvider:
     return request.app.state.embedding
 
 
-def milvus_dep(request: Request) -> MilvusFaceStore:
-    return request.app.state.milvus
+def s3_fetcher_dep(request: Request) -> S3ImageFetcher:
+    return request.app.state.s3_fetcher
 
 
 SettingsDep = Annotated[Settings, Depends(settings_dep)]
-MinioDep = Annotated[MinioStorageService, Depends(minio_dep)]
 IQADep = Annotated[MLInferenceIQAService, Depends(iqa_dep)]
 EmbeddingDep = Annotated[FaceEmbeddingProvider, Depends(embedding_dep)]
-MilvusDep = Annotated[MilvusFaceStore, Depends(milvus_dep)]
+S3FetcherDep = Annotated[S3ImageFetcher, Depends(s3_fetcher_dep)]

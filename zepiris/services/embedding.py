@@ -9,7 +9,7 @@ import cv2
 import numpy as np
 
 from zepiris.exceptions import ImageEncodeError
-from zepiris.schemas.ml_inference import FaceEmbeddingResult
+from zepiris.schemas.ml_inference import FaceDetectionResult, FaceEmbeddingResult
 
 if TYPE_CHECKING:
     from zepiris.services.ml_client import MLInferenceClient
@@ -25,6 +25,20 @@ class FaceEmbeddingProvider(ABC):
     @abstractmethod
     def embed(self, image_bgr: np.ndarray) -> FaceEmbeddingResult:
         raise NotImplementedError
+
+    def detect_box(self, image_bgr: np.ndarray) -> FaceDetectionResult:
+        """Detect the primary face and return its normalized bounding box.
+
+        Default implementation derives the box from :meth:`embed` (no box info,
+        so it reports a full-frame box when a face is found). Real providers
+        override this with a cheaper detection-only call.
+        """
+        result = self.embed(image_bgr)
+        return FaceDetectionResult(
+            face_detected=result.face_detected,
+            bbox=[0.0, 0.0, 1.0, 1.0] if result.face_detected else [0.0, 0.0, 0.0, 0.0],
+            score=1.0 if result.face_detected else 0.0,
+        )
 
 
 class StubFaceEmbeddingService(FaceEmbeddingProvider):
@@ -65,3 +79,10 @@ class MLInferenceEmbeddingService(FaceEmbeddingProvider):
             raise ImageEncodeError()
         image_b64 = base64.b64encode(buf.tobytes()).decode("utf-8")
         return self._client.embed_face(image_b64)
+
+    def detect_box(self, image_bgr: np.ndarray) -> FaceDetectionResult:
+        ok, buf = cv2.imencode(".jpg", image_bgr)
+        if not ok:
+            raise ImageEncodeError()
+        image_b64 = base64.b64encode(buf.tobytes()).decode("utf-8")
+        return self._client.detect_face(image_b64)

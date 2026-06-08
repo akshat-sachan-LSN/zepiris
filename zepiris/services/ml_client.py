@@ -27,6 +27,7 @@ import httpx
 
 from zepiris.schemas.ml_inference import (
     BlurDetectionResult,
+    FaceDetectionResult,
     FaceEmbeddingResult,
     ImageQualityAssessmentResult,
     NSFWDetectionResult,
@@ -132,6 +133,21 @@ class MLInferenceClient:
         response = self.client.post("/v1/face/embed", json=payload)
         response.raise_for_status()
         return FaceEmbeddingResult(**response.json())
+
+    def detect_face(self, image_b64: str) -> FaceDetectionResult:
+        """Detect the primary face and return its normalized bounding box.
+
+        Args:
+            image_b64: Image as base64-encoded string
+
+        Returns:
+            FaceDetectionResult: detection flag + normalized bbox + score
+        """
+
+        payload = self._prepare_image_json(image_b64)
+        response = self.client.post("/v1/face/detect", json=payload)
+        response.raise_for_status()
+        return FaceDetectionResult(**response.json())
 
     def assess_image_quality(self, image_b64: str) -> ImageQualityAssessmentResult:
         """Run combined image quality assessment (NSFW + spoof + blur).

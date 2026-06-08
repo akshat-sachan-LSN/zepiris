@@ -1,0 +1,128 @@
+==============================================================================
+ ZepIris — Run Commands (macOS / Apple Silicon, local Poetry venv)
+==============================================================================
+Run everything from the repo root:
+    cd /Users/lsn-akshat/Desktop/LSN-Github/zepiris
+
+Poetry was installed to ~/.local/bin. Put it on PATH for every new shell:
+    export PATH="$HOME/.local/bin:$PATH"
+
+The venv lives at ./.venv (Python 3.12). Use `poetry run ...` or call
+./.venv/bin/<tool> directly.
+
+
+------------------------------------------------------------------------------
+ 0. ONE-TIME SETUP  (already done — listed for reference / fresh machines)
+------------------------------------------------------------------------------
+# Install Poetry
+curl -sSL https://install.python-poetry.org | python3.12 -
+
+# Point the venv at Python 3.12 (system python is 3.9, too old)
+poetry env use "$(pyenv prefix 3.12)/bin/python3.12"
+
+# Base + dev deps
+poetry install --with dev
+
+# ML stack from PyPI (NOT the pinned pytorch-cpu source — it has no
+# Apple-Silicon wheels, which is why `poetry install --extras ml` fails here)
+./.venv/bin/pip install "torch>=2.2.0" "torchvision>=0.17.0" \
+    "insightface>=0.7.3,<0.8.0" "onnx>=1.14.0,<1.22.0" "onnxruntime>=1.17.0"
+
+
+------------------------------------------------------------------------------
+ 1. ML INFERENCE SERVICE  (port 8001) — face embed + image quality (IQA)
+------------------------------------------------------------------------------
+# IMPORTANT: the IQA model paths default to /app/models/* (the Docker path).
+# Running locally you MUST point them at ./models or nsfw/spoof/blur load as
+# "degraded" and IQA is disabled. (buffalo_l face model auto-downloads.)
+export ML_SERVICE_NSFW_LOCAL_MODEL_PATH="$(pwd)/models/nsfw_model.pth"
+export ML_SERVICE_SPOOF_LOCAL_MODEL_PATH="$(pwd)/models/spoof_model.pth"
+export ML_SERVICE_BLUR_LOCAL_MODEL_PATH="$(pwd)/models/blur_model.pth"
+
+poetry run zepiris-ml-inference-api
+#   equivalent:
+#   ./.venv/bin/python -m uvicorn zepiris.ml_inference.app:app --host 0.0.0.0 --port 8001
+
+# Health / docs:
+#   curl http://localhost:8001/healthz
+#   open  http://localhost:8001/docs
+# NOTE: GET / returns 404 — that's normal, there is no root route. Use /docs.
+
+
+------------------------------------------------------------------------------
+ 2. MAIN API  (port 8000) — face insert / search / upsert / delete
+------------------------------------------------------------------------------
+# RECOMMENDED ON THIS MACHINE (low disk): run only the infra in Docker, and run
+# the API + ML service natively. Avoids the multi-GB local image builds, which
+# do NOT fit in the available disk and corrupt Docker's store when they run out.
+#
+# Step A — start infra containers only (pulled images, no local build):
+docker-compose up -d minio etcd milvus
+docker-compose ps                          # wait until all 3 are (healthy)
+#
+# Step B — start the ML service natively (see section 1, keep it running).
+#
+# Step C — start the API natively, pointing at the Docker infra + ML service:
+export ZEPIRIS_ML_INFERENCE_SERVICE_URL=http://localhost:8001
+export ZEPIRIS_MINIO_ENDPOINT=localhost:9002
+export ZEPIRIS_MINIO_ACCESS_KEY=minioadmin
+export ZEPIRIS_MINIO_SECRET_KEY=minioadmin
+export ZEPIRIS_MINIO_BUCKET=zepiris
+export ZEPIRIS_MINIO_SECURE=false
+export ZEPIRIS_MILVUS_HOST=localhost
+export ZEPIRIS_MILVUS_PORT=19530
+export ZEPIRIS_MILVUS_COLLECTION=zepiris_faces
+export ZEPIRIS_MILVUS_EMBEDDING_DIM=512
+poetry run zepiris-api
+#   Health:  curl http://localhost:8000/healthz   ->  {"status":"ok"}
+#   Ready:   curl http://localhost:8000/readyz    ->  {"status":"ready"}
+#   Docs:    open http://localhost:8000/docs
+#
+# NOTE on IQA gate: the bundled nsfw_model.pth is over-aggressive and may flag
+# normal photos (is_safe:false) -> insert returns "image_quality_check_failed".
+# Relax it on the ML service if needed:  export ML_SERVICE_NSFW_THRESHOLD=0.999
+
+# --- Verified end-to-end smoke test (real face) ---
+.venv/bin/python -c "import cv2; from insightface.data import get_image; cv2.imwrite('/tmp/face1.jpg', get_image('t1'))"
+curl -s -X POST localhost:8000/v1/faces/insert -F id=person-001 -F tenant=default -F file=@/tmp/face1.jpg
+curl -s localhost:8000/v1/faces/get/person-001
+curl -s -X POST "localhost:8000/v1/faces/search?top_k=5" -F id=q1 -F tenant=default -F file=@/tmp/face1.jpg
+
+
+------------------------------------------------------------------------------
+ 3. TESTS / LINT
+------------------------------------------------------------------------------
+poetry run pytest -q
+poetry run ruff check .
+poetry run ruff format .          # auto-format
+
+
+------------------------------------------------------------------------------
+ 4. FULL STACK VIA DOCKER  (needed for insert/search/delete end-to-end)
+------------------------------------------------------------------------------
+# Install Docker Desktop (Homebrew), then launch it once manually:
+brew install --cask docker
+open -a Docker                    # wait until the whale icon says "running"
+
+# Bring up everything (minio, etcd, milvus, ml-inference, api):
+docker-compose up -d
+docker-compose ps                 # all should be Up (healthy)
+docker-compose logs -f api        # follow logs
+
+# Smoke test once healthy:
+curl http://localhost:8000/healthz        # {"status":"ok"}
+curl http://localhost:8000/readyz         # {"status":"ready"}
+
+# Tear down:
+docker-compose down               # stop + remove containers
+docker-compose down -v            # ALSO delete all data volumes
+
+
+------------------------------------------------------------------------------
+ 5. FACE-DETECTION PADDING TUNING  (the edge-case fix)
+------------------------------------------------------------------------------
+# A frame-filling / border-touching face is retried on a reflect-padded copy.
+# Toggle / tune on the ML service (defaults shown):
+export ML_SERVICE_FACE_ENABLE_PADDING_RETRY=true
+export ML_SERVICE_FACE_PADDING_FRACTION=0.25     # border = 25% of longest side
+==============================================================================

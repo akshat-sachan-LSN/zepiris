@@ -54,16 +54,6 @@ class ImageEncodeError(ZepirisServiceError):
         super().__init__("image_encode_failed", detail="image_encode_failed")
 
 
-class EmbeddingDimensionMismatchError(ZepirisServiceError):
-    """ML embedding length does not match Milvus collection dimension (config bug)."""
-
-    default_status_code = 500
-
-    def __init__(self, expected: int, got: int) -> None:
-        d = f"embedding_dim_mismatch_expected_{expected}_got_{got}"
-        super().__init__(d, detail=d)
-
-
 # --- ML inference (HTTP client) ---
 
 
@@ -107,7 +97,7 @@ class MLInferenceTransportError(ZepirisServiceError):
         )
 
 
-# --- Face / vector store ---
+# --- Face / quality ---
 
 
 class ImageQualityCheckFailedError(ZepirisServiceError):
@@ -117,25 +107,55 @@ class ImageQualityCheckFailedError(ZepirisServiceError):
         super().__init__("image_quality_check_failed", detail=detail)
 
 
-class DuplicateFaceIdError(ZepirisServiceError):
-    default_status_code = 409
+class LivenessCheckFailedError(ZepirisServiceError):
+    """Raised when the image is a spoof (photo/screen replay), not a live face.
 
-    def __init__(self, face_id: str) -> None:
-        d = f"face_id_{face_id}_already_exists"
-        super().__init__(d, detail=d)
+    Distinct from :class:`ImageQualityCheckFailedError` so callers can tell a
+    liveness rejection apart from blur/NSFW quality failures.
+    """
 
+    default_status_code = 422
 
-class FaceRecordNotFoundError(ZepirisServiceError):
-    default_status_code = 404
-
-    def __init__(self, face_id: str) -> None:
-        d = f"face_id_{face_id}_not_found"
-        super().__init__(d, detail=d)
+    def __init__(self, detail: dict[str, Any]) -> None:
+        super().__init__("liveness_failed", detail=detail)
 
 
-class MilvusOperationError(ZepirisServiceError):
-    default_status_code = 500
+# --- Reference image (S3) ---
 
-    def __init__(self, operation: str, cause: BaseException) -> None:
-        d = f"milvus_{operation}_failed: {cause}"
-        super().__init__(d, detail=d)
+
+class ReferenceImageFetchError(ZepirisServiceError):
+    """Could not retrieve the reference image from the supplied S3 URL."""
+
+    default_status_code = 400
+
+    def __init__(self, reason: str, detail_msg: str) -> None:
+        super().__init__(
+            "reference_image_fetch_failed",
+            detail={
+                "message": "reference_image_fetch_failed",
+                "reason": reason,
+                "detail": detail_msg,
+            },
+        )
+
+
+class ReferenceImageDecodeError(ZepirisServiceError):
+    """Fetched reference bytes are not a decodable image."""
+
+    default_status_code = 400
+
+    def __init__(self) -> None:
+        super().__init__(
+            "reference_image_decode_failed", detail="reference_image_decode_failed"
+        )
+
+
+class ReferenceFaceNotFoundError(ZepirisServiceError):
+    """No face detected in the reference image."""
+
+    default_status_code = 400
+
+    def __init__(self) -> None:
+        super().__init__(
+            "reference_face_not_detected", detail="reference_face_not_detected"
+        )

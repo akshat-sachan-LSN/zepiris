@@ -7,7 +7,7 @@ from insightface.app import FaceAnalysis
 from insightface.app.common import Face
 
 from zepiris.ml_inference.base import ModelService, ModelServiceConfig
-from zepiris.schemas.ml_inference import FaceEmbeddingResult
+from zepiris.schemas.ml_inference import FaceDetectionResult, FaceEmbeddingResult
 
 
 class FaceEmbeddingService(ModelService):
@@ -25,6 +25,8 @@ class FaceEmbeddingService(ModelService):
         detection_size: tuple[int, int] = (640, 640),
         facial_area_threshold: float = 0.01,
         device: str = "cpu",
+        enable_padding_retry: bool = True,
+        padding_fraction: float = 0.25,
     ) -> None:
         """Initialize face embedding service.
 
@@ -33,10 +35,19 @@ class FaceEmbeddingService(ModelService):
             detection_size: Face detection size as (width, height) tuple
             facial_area_threshold: Minimum face area as fraction of image area
             device: Inference device ("cpu" or "cuda")
+            enable_padding_retry: If True, retry detection on a reflect-padded copy
+                of the image when no face is found on the first pass. Tightly cropped
+                faces that fill the frame or touch a border are frequently missed by
+                the detector because it has no margin/context to work with; padding
+                restores that margin.
+            padding_fraction: Border width added on each side during the retry,
+                expressed as a fraction of the image's larger dimension.
         """
         self._embedding_dim = embedding_dim
         self._detection_size = detection_size
         self._facial_area_threshold = facial_area_threshold
+        self._enable_padding_retry = enable_padding_retry
+        self._padding_fraction = padding_fraction
         self._face_app: FaceAnalysis | None = None
         config = ModelServiceConfig(
             model_name="face_embedding",
@@ -61,21 +72,18 @@ class FaceEmbeddingService(ModelService):
         self._face_app = app
         return self._face_app
 
-    def preprocess(self, image_rgb: np.ndarray) -> dict:
-        """Detect faces and select the most central face above area threshold.
+    def _select_face(self, image_rgb: np.ndarray) -> Face | None:
+        """Detect faces in an image and select the most central qualifying one.
 
-        Args:
-            image_rgb: Input image in RGB format, shape (H, W, 3), dtype uint8
-
-        Returns:
-            dict: {"image": original image, "face": selected Face object or None}
+        Returns the chosen ``Face`` (detection + keypoints) or ``None`` when the
+        detector finds nothing.
         """
         app = self.load_model()
 
         bboxes, kpss = app.det_model.detect(image_rgb, max_num=0, metric="default")
 
         if len(bboxes) == 0:
-            return {"image": image_rgb, "face": None}
+            return None
 
         h, w = image_rgb.shape[:2]
         img_area = h * w
@@ -100,13 +108,49 @@ class FaceEmbeddingService(ModelService):
                 min_dist = dist
                 selected_idx = i
 
-        face = Face(
+        return Face(
             bbox=bboxes[selected_idx, :4],
             kps=kpss[selected_idx],
             det_score=bboxes[selected_idx, 4],
         )
 
-        return {"image": image_rgb, "face": face}
+    def _pad_image(self, image_rgb: np.ndarray) -> np.ndarray:
+        """Add a reflective border so a frame-filling face regains surrounding margin."""
+        h, w = image_rgb.shape[:2]
+        pad = int(round(max(h, w) * self._padding_fraction))
+        if pad <= 0:
+            return image_rgb
+        return np.pad(
+            image_rgb,
+            ((pad, pad), (pad, pad), (0, 0)),
+            mode="reflect",
+        )
+
+    def preprocess(self, image_rgb: np.ndarray) -> dict:
+        """Detect faces and select the most central face above area threshold.
+
+        If the first detection pass finds nothing and ``enable_padding_retry`` is
+        set, the image is reflect-padded and detection is retried. Recognition then
+        runs on the padded image so the embedding keeps full facial context.
+
+        Args:
+            image_rgb: Input image in RGB format, shape (H, W, 3), dtype uint8
+
+        Returns:
+            dict: {"image": image used for recognition, "face": Face or None}
+        """
+        face = self._select_face(image_rgb)
+        if face is not None:
+            return {"image": image_rgb, "face": face}
+
+        if self._enable_padding_retry:
+            padded = self._pad_image(image_rgb)
+            if padded is not image_rgb:
+                face = self._select_face(padded)
+                if face is not None:
+                    return {"image": padded, "face": face}
+
+        return {"image": image_rgb, "face": None}
 
     def predict(self, preprocessed_data: dict) -> tuple[np.ndarray, bool]:
         """Extract embedding for the detected face using the recognition model.
@@ -148,6 +192,35 @@ class FaceEmbeddingService(ModelService):
             embedding=embedding_list,
             embedding_dim=len(embedding_list),
         )
+
+    def detect_box(self, image_rgb: np.ndarray) -> FaceDetectionResult:
+        """Detect the primary face and return its normalized bounding box.
+
+        Detection only (no recognition), so it is cheap enough to poll. Runs on
+        the original frame (no padding retry) so the returned box maps directly
+        to the image shown to the user. Used by the UI readiness ring to decide
+        whether the face is positioned inside the on-screen circle.
+
+        Args:
+            image_rgb: Input image in RGB format, shape (H, W, 3), dtype uint8
+
+        Returns:
+            FaceDetectionResult: detection flag, normalized [x1, y1, x2, y2], score
+        """
+        face = self._select_face(image_rgb)
+        if face is None:
+            return FaceDetectionResult(face_detected=False, bbox=[0.0, 0.0, 0.0, 0.0])
+
+        h, w = image_rgb.shape[:2]
+        x1, y1, x2, y2 = (float(v) for v in face.bbox[:4])
+        bbox = [
+            max(0.0, min(1.0, x1 / w)),
+            max(0.0, min(1.0, y1 / h)),
+            max(0.0, min(1.0, x2 / w)),
+            max(0.0, min(1.0, y2 / h)),
+        ]
+        score = float(getattr(face, "det_score", 0.0) or 0.0)
+        return FaceDetectionResult(face_detected=True, bbox=bbox, score=score)
 
     def embed(self, image_rgb: np.ndarray) -> FaceEmbeddingResult:
         """Generate face embedding from image.

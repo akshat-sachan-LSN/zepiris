@@ -4,14 +4,14 @@ from zepiris.services.embedding import (
     StubFaceEmbeddingService,
 )
 from zepiris.services.iqa import MLInferenceIQAService
-from zepiris.services.milvus_store import MilvusFaceStore
-from zepiris.services.minio_storage import MinioStorageService
+from zepiris.services.s3_fetcher import S3ImageFetcher
+from zepiris.services.similarity import cosine
 
 __all__ = [
     "FaceEmbeddingProvider",
     "MLInferenceEmbeddingService",
     "MLInferenceIQAService",
     "StubFaceEmbeddingService",
-    "MinioStorageService",
-    "MilvusFaceStore",
+    "S3ImageFetcher",
+    "cosine",
 ]

@@ -2,78 +2,13 @@
 name: zepiris
 
 services:
-  # MinIO: S3-compatible object storage
-  minio:
-    image: minio/minio:latest
-    container_name: zepiris-minio
-    environment:
-      MINIO_ROOT_USER: minioadmin
-      MINIO_ROOT_PASSWORD: minioadmin
-    ports:
-      - "9002:9000"      # MinIO API (host 9002 → container 9000)
-      - "9001:9001"      # MinIO Console
-    volumes:
-      - minio_data:/data
-    command: server /data --console-address ":9001"
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
-      interval: 30s
-      timeout: 20s
-      retries: 3
-
-  # Etcd: metadata storage for Milvus
-  etcd:
-    image: quay.io/coreos/etcd:v3.5.5
-    container_name: zepiris-etcd
-    environment:
-      ETCD_AUTO_COMPACTION_MODE: revision
-      ETCD_AUTO_COMPACTION_RETENTION: "1000"
-      ETCD_QUOTA_BACKEND_BYTES: "4294967296"
-      ETCD_SNAPSHOT_COUNT: "50000"
-    volumes:
-      - etcd_data:/etcd
-    command: etcd -advertise-client-urls=http://127.0.0.1:2379 -listen-client-urls http://0.0.0.0:2379 --data-dir /etcd
-    healthcheck:
-      test: ["CMD", "etcdctl", "endpoint", "health"]
-      interval: 30s
-      timeout: 20s
-      retries: 3
-
-  # Milvus: Vector database (Standalone) - v2.6 (latest stable)
-  milvus:
-    image: milvusdb/milvus:v2.6.12
-    container_name: zepiris-milvus
-    environment:
-      ETCD_ENDPOINTS: etcd:2379
-      MINIO_ADDRESS: minio
-      MINIO_PORT: "9000"
-      MINIO_ACCESS_KEY_ID: minioadmin
-      MINIO_SECRET_ACCESS_KEY: minioadmin
-      MINIO_BUCKET_NAME: zepiris
-      MINIO_ROOT_PATH: milvus
-    volumes:
-      - milvus_data:/var/lib/milvus
-    ports:
-      - "19530:19530"   # gRPC API
-      - "9091:9091"     # Metrics
-    command: milvus run standalone
-    depends_on:
-      etcd:
-        condition: service_healthy
-      minio:
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
-      interval: 30s
-      timeout: 20s
-      retries: 3
-
   # ML Inference: FastAPI microservice with PyTorch models
   ml-inference:
     build:
       context: .
       dockerfile: ml_inference.Dockerfile
     container_name: zepiris-ml-inference
+    restart: always
     environment:
       ML_SERVICE_HOST: "0.0.0.0"
       ML_SERVICE_PORT: "8001"
@@ -85,6 +20,10 @@ services:
       ML_SERVICE_SPOOF_LOCAL_MODEL_PATH: "/app/models/spoof_model.pth"
       ML_SERVICE_BLUR_MODEL_SOURCE: "auto"
       ML_SERVICE_BLUR_LOCAL_MODEL_PATH: "/app/models/blur_model.pth"
+    volumes:
+      # Persist the InsightFace buffalo_l weights (~300MB) downloaded on first
+      # startup, so container recreates don't re-download them every time.
+      - insightface_cache:/home/appuser/.insightface
     ports:
       - "8001:8001"    # ML Inference API
     healthcheck:
@@ -93,33 +32,22 @@ services:
       timeout: 30s    # Longer timeout for model loading on startup
       retries: 5
 
-  # ZepIris API
+  # ZepIris API (stateless 1:1 verify — live photo vs S3 reference)
   api:
     build:
       context: .
       dockerfile: Dockerfile
     container_name: zepiris-api
+    restart: always
     environment:
       ZEPIRIS_API_TITLE: "ZepIris"
       ZEPIRIS_API_VERSION: "1.0.0"
-      ZEPIRIS_MINIO_ENDPOINT: "minio:9000"
-      ZEPIRIS_MINIO_ACCESS_KEY: "minioadmin"
-      ZEPIRIS_MINIO_SECRET_KEY: "minioadmin"
-      ZEPIRIS_MINIO_BUCKET: "zepiris"
-      ZEPIRIS_MINIO_SECURE: "false"
-      ZEPIRIS_MILVUS_HOST: "milvus"
-      ZEPIRIS_MILVUS_PORT: "19530"
-      ZEPIRIS_MILVUS_COLLECTION: "zepiris_faces"
-      ZEPIRIS_MILVUS_EMBEDDING_DIM: "512"
+      ZEPIRIS_VERIFY_THRESHOLD: "0.5"
       # ML Inference service (main API encodes images to base64 and calls /v1/iqa/assess, /v1/face/embed)
       ZEPIRIS_ML_INFERENCE_SERVICE_URL: "http://ml-inference:8001"
     ports:
       - "8000:8000"
     depends_on:
-      milvus:
-        condition: service_healthy
-      minio:
-        condition: service_healthy
       ml-inference:
         condition: service_healthy
     healthcheck:
@@ -129,9 +57,7 @@ services:
       retries: 3
 
 volumes:
-  minio_data:
-  etcd_data:
-  milvus_data:
+  insightface_cache:
 
 networks:
   default:

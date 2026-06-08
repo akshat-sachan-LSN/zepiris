@@ -1,14 +1,8 @@
 from zepiris.schemas.face import (
     MAX_IMAGE_SIZE_BYTES,
     MAX_IMAGE_SIZE_MB,
-    CRUDOperation,
-    CRUDResult,
-    CRUDStatus,
-    DeleteResponse,
-    SearchMatch,
-    SearchResponse,
-    SearchStruct,
-    UpsertResponse,
+    VerificationResult,
+    VerifyResponse,
 )
 from zepiris.schemas.ml_inference import (
     BlurDetectionResult,
@@ -21,14 +15,8 @@ from zepiris.schemas.ml_inference import (
 __all__ = [
     "MAX_IMAGE_SIZE_MB",
     "MAX_IMAGE_SIZE_BYTES",
-    "SearchMatch",
-    "SearchStruct",
-    "CRUDOperation",
-    "CRUDStatus",
-    "CRUDResult",
-    "SearchResponse",
-    "UpsertResponse",
-    "DeleteResponse",
+    "VerificationResult",
+    "VerifyResponse",
     "FaceEmbeddingResult",
     "SpoofDetectionResult",
     "NSFWDetectionResult",

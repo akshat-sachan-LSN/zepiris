@@ -17,6 +17,21 @@ class FaceEmbeddingResult(BaseModel):
     embedding_dim: int
 
 
+class FaceDetectionResult(BaseModel):
+    """Result of a lightweight face-detection-only pass (no recognition).
+
+    Attributes:
+        face_detected: Whether a face was found
+        bbox: [x1, y1, x2, y2] of the selected face, normalized to [0, 1]
+              relative to the input image (all zeros when no face)
+        score: Detector confidence for the selected face
+    """
+
+    face_detected: bool
+    bbox: list[float]
+    score: float = 0.0
+
+
 class SpoofDetectionResult(BaseModel):
     """Result of spoof detection inference.
 

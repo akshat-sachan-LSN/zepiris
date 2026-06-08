@@ -10,6 +10,7 @@ import torch
 
 from zepiris.ml_inference.base import ModelService, ModelServiceConfig
 from zepiris.ml_inference.models import MobileNetV3LSpoof
+from zepiris.ml_inference.moire_detection import ScreenReplayDetector
 from zepiris.schemas.ml_inference import SpoofDetectionResult
 
 INPUT_SIZE = (224, 224)
@@ -33,6 +34,7 @@ class SpoofDetectionService(ModelService):
         local_model_path: str | None = None,
         model_source: str = "auto",
         spoof_threshold: float = 0.5,
+        screen_replay_detector: ScreenReplayDetector | None = None,
         device: str = "cpu",
     ) -> None:
         """Initialize anti-spoofing service.
@@ -42,10 +44,15 @@ class SpoofDetectionService(ModelService):
             huggingface_model_file: Filename of model weights in the repo
             local_model_path: Optional local path to model weights
             model_source: ``"auto"``, ``"local"``, or ``"huggingface"``
-            spoof_threshold: Threshold for spoof detection (default 0.5)
+            spoof_threshold: Threshold for the learned-model liveness probability
+                (``prob_live`` must exceed this; default 0.5).
+            screen_replay_detector: Optional passive moiré/glare detector. When
+                provided, an image is only ``is_live`` if the model passes AND
+                the detector does not flag a recaptured screen.
             device: Inference device ("cpu" or "cuda")
         """
         self._spoof_threshold = spoof_threshold
+        self._screen_replay_detector = screen_replay_detector
         self._model: MobileNetV3LSpoof | None = None
         config = ModelServiceConfig(
             model_name="spoof_detection",
@@ -127,3 +134,28 @@ class SpoofDetectionService(ModelService):
             is_live=is_live,
             probability=prob_live,
         )
+
+    def forward(self, image_rgb: np.ndarray) -> SpoofDetectionResult:
+        """Run the learned spoof model, then AND-gate with screen-replay detection.
+
+        The image is declared live only if the model's ``prob_live`` clears the
+        threshold AND the passive moiré/glare detector (when configured) does
+        not flag a recaptured screen. Either signal alone can mark it spoofed.
+
+        Args:
+            image_rgb: Input image in RGB format, shape (H, W, 3), dtype uint8
+
+        Returns:
+            SpoofDetectionResult: ``is_live`` reflects the fused decision;
+                ``probability`` remains the model's live probability.
+        """
+        result = super().forward(image_rgb)
+        assert isinstance(result, SpoofDetectionResult)  # noqa: S101
+
+        if self._screen_replay_detector is None:
+            return result
+
+        screen = self._screen_replay_detector.analyze(image_rgb)
+        if screen.is_screen:
+            return SpoofDetectionResult(is_live=False, probability=result.probability)
+        return result

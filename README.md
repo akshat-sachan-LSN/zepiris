@@ -11,7 +11,7 @@
 
 ZepIris is Zepto's purpose-built face authentication platform — open-sourced for teams running identity verification at operational scale.
 
-It handles the full pipeline: face detection, embedding generation, vector search, and spoof/blur/nudity flagging. Designed to work on budget smartphones, in low light, under high concurrency.
+It is a **stateless 1:1 face-verification** service: send a live selfie plus a reference image (as an S3 URL) and get a match decision back. It handles the full pipeline on the live photo — face detection, liveness/IQA, embedding generation — then embeds the reference image and compares the two with cosine similarity. Designed to work on budget smartphones, in low light, under high concurrency. **Nothing is persisted.**
 
 If you're running attendance or identity workflows at scale and don't want to stitch together multiple vendors, this is it.
 
@@ -26,7 +26,6 @@ If you're running attendance or identity workflows at scale and don't want to st
 - [Architecture](#architecture)
 - [Quick Start](#quick-start)
 - [API Endpoints](#api-endpoints)
-- [Database Schema](#database-schema)
 - [Configuration](#configuration)
 - [Development](#development)
 - [Testing](#testing)
@@ -41,22 +40,21 @@ If you're running attendance or identity workflows at scale and don't want to st
 
 ## Overview
 
-ZepIris simplifies face recognition and verification workflows by providing:
+ZepIris simplifies face verification workflows by providing:
 
+- **Stateless 1:1 verification** — compare a live photo against a reference image; nothing is stored
 - **Pre-integrated face embeddings** using InsightFace's buffalo_l model (512-dimensional vectors)
-- **1-to-N face vector search** via Milvus for fast COSINE similarity matching
-- **Automated content safety checks**: nudity detection, anti-spoofing, blur detection — all via a dedicated ML inference service
-- **Multi-tenant support** — per-tenant face enrollment and search with isolated namespaces
-- **Full CRUD operations** — insert, upsert, delete, and get for face records
+- **COSINE similarity matching** with a configurable decision threshold
+- **Automated content safety checks**: nudity detection, anti-spoofing/liveness, blur detection — all via a dedicated ML inference service
+- **Reference image by S3 URL** — supply a presigned/public URL; fetched over plain HTTP, no AWS credentials required
 - **Production-ready microservice architecture** with independent scaling for ML inference
-- **S3-compatible image storage** via MinIO
 - **REST API** with OpenAPI/Swagger auto-documentation and `requestId` traceability
 
 ### Use Cases
 
-- **Attendance Tracking** — Enroll employee faces, query against live camera feeds
+- **Attendance Tracking** — Verify a live selfie against a stored reference photo
 - **Onboarding Workflows** — Identity verification with liveness detection
-- **Face-Based Access Control** — 1-to-N face matching with content safety validation
+- **Face-Based Access Control** — 1:1 face matching with content safety validation
 - **Quality Assurance** — Automatic detection of low-quality, spoofed, or unsafe images
 
 ---
@@ -66,15 +64,14 @@ ZepIris simplifies face recognition and verification workflows by providing:
 
 | Capability                    | Description                                                                              |
 | ----------------------------- | ---------------------------------------------------------------------------------------- |
+| **Stateless 1:1 Verify**      | Compare a live photo against a reference image; no enrollment, no storage                |
 | **Face Embedding**            | Extract 512-dimensional L2-normalized embeddings using InsightFace buffalo_l             |
-| **1-to-N Face Search**        | Query vectors against Milvus for fast COSINE similarity matching                         |
-| **Full CRUD API**             | Insert, upsert, delete, and retrieve face records with multi-tenant isolation            |
-| **Content Safety (ML)**       | Nudity, spoof/deepfake, and blur detection via dedicated ML inference microservice       |
-| **Multi-Tenant**              | Per-tenant face enrollment and search with isolated namespaces                           |
+| **COSINE Matching**           | Configurable per-request decision threshold (`ZEPIRIS_VERIFY_THRESHOLD`)                 |
+| **Content Safety (ML)**       | Nudity, spoof/liveness, and blur detection via dedicated ML inference microservice       |
+| **Reference by S3 URL**       | Reference image fetched over plain HTTP from a presigned/public URL (no AWS creds)       |
 | **Microservice Architecture** | Separate ML inference service (port 8001) scales independently from main API (port 8000) |
-| **Image Storage**             | S3-compatible MinIO integration for persistent image archival                            |
 | **REST API**                  | FastAPI with OpenAPI/Swagger docs, `requestId` on every response                         |
-| **Docker Ready**              | Multi-stage Dockerfiles for both services + Docker Compose with all dependencies         |
+| **Docker Ready**              | Multi-stage Dockerfiles for both services + Docker Compose (2 containers only)           |
 | **Configurable Thresholds**   | Fine-tune quality checks (blur sensitivity, spoof threshold, nudity confidence)          |
 
 
@@ -82,56 +79,48 @@ ZepIris simplifies face recognition and verification workflows by providing:
 
 ## Architecture
 
-ZepIris consists of **two independent FastAPI microservices** that communicate via HTTP:
+ZepIris consists of **two independent FastAPI microservices** that communicate via HTTP. There is **no** vector database, object storage, or metadata store — the deployment is just `api` + `ml-inference`.
 
 ```
 ┌─────────────────────────────────────────────────┐
 │  Client / Application                           │
 └──────────────┬──────────────────────────────────┘
-               │ (REST API)
+               │ (REST API: live photo + reference S3 URL)
       ┌────────▼──────────────────────────────┐
       │  Main API (port 8000)                 │
-      │  ├─ POST /v1/faces/search             │
-      │  ├─ POST /v1/faces/insert             │
-      │  ├─ POST /v1/faces/upsert             │
-      │  ├─ DELETE /v1/faces/delete            │
-      │  ├─ GET  /v1/faces/get/{face_id}      │
+      │  ├─ POST /v1/faces/verify             │
+      │  ├─ POST /v1/faces/detect             │
+      │  ├─ GET  /ui  (single verify page)    │
       │  ├─ GET  /healthz                     │
       │  └─ GET  /readyz                      │
-      └───┬────────────────┬──────────────────┘
-          │                │
-       ┌──▼──┐          ┌──▼─────┐
-       │MinIO│          │ Milvus │
-       │ S3  │          │ Vector │
-       │Store│          │ Store  │
-       └─────┘          └────────┘
-                           │
-      ┌────────────────────▼───────────────────┐
-      │ ML Inference (port 8001)                │
-      │ ├─ POST /v1/embed   (Face Embedding)    │
-      │ ├─ POST /v1/nudity  (Nudity Detection)  │
-      │ ├─ POST /v1/spoof   (Spoof Detection)   │
-      │ ├─ POST /v1/blur    (Blur Detection)     │
-      │ └─ POST /v1/assess  (Combined IQA)      │
-      └─────────────────────────────────────────┘
+      └───┬───────────────────────────┬───────┘
+          │                           │
+          │ (plain HTTP GET)          │ (base64 over HTTP)
+   ┌──────▼────────┐        ┌─────────▼───────────────────────┐
+   │ Reference img │        │ ML Inference (port 8001)         │
+   │ via S3 URL    │        │ ├─ POST /v1/embed  (Embedding)   │
+   │ (not stored)  │        │ ├─ POST /v1/nudity (Nudity)      │
+   └───────────────┘        │ ├─ POST /v1/spoof  (Spoof)       │
+                            │ ├─ POST /v1/blur   (Blur)        │
+                            │ └─ POST /v1/assess (Combined IQA)│
+                            └──────────────────────────────────┘
 ```
 
 ### Main API Service (Port 8000)
 
 **Responsibilities:**
 
-- Handle user-facing CRUD and search endpoints under `/v1/faces/`
-- Manage image uploads and storage via MinIO
-- Coordinate with ML inference service for IQA and embedding extraction
-- Index face embeddings in Milvus with multi-tenant support
-- Return structured responses with `requestId` for traceability
+- Handle the stateless verify endpoint and the detect poll under `/v1/faces/`
+- Validate the uploaded live photo (size ≤ 5MB; decodable)
+- Coordinate with ML inference service for liveness/IQA and embedding extraction
+- Fetch the reference image from the supplied `s3_url` over plain HTTP (no AWS creds)
+- Compute cosine similarity and return the match decision with `requestId`
+- Persist nothing
 
 **Dependencies:**
 
 - FastAPI, Uvicorn, Pydantic
-- Milvus vector database (with Etcd for metadata)
-- MinIO (S3-compatible object storage)
-- HTTPx (for ML service communication)
+- HTTPx (for ML service communication and reference-image fetch)
 
 ### ML Inference Service (Port 8001)
 
@@ -161,7 +150,7 @@ ZepIris consists of **two independent FastAPI microservices** that communicate v
 - **Python 3.10–3.14** (tested on 3.10–3.14)
 - **Poetry 2.x** for dependency management ([install here](https://python-poetry.org/docs/#installation))
 - **Docker & Docker Compose** (v1.29+; recommended for all-in-one setup)
-- **4GB+ RAM** for Milvus, **10GB+ free disk space**
+- **2GB+ RAM**, **5GB+ free disk space** (for the ML models)
 
 Check your versions:
 
@@ -179,7 +168,7 @@ For a fully containerized local setup:
 git clone <repository-url>
 cd zepiris
 
-# Start all services (Milvus, MinIO, Etcd, API, ML inference)
+# Start both services (api, ml-inference)
 docker-compose up -d
 
 # Verify health
@@ -194,13 +183,10 @@ docker-compose down
 
 The Compose file sets `name: zepiris`, so images are tagged `zepiris-api` and `zepiris-ml-inference` regardless of clone directory name.
 
-This starts:
+This starts **2 containers**:
 
 - Main API (port 8000)
 - ML inference (port 8001)
-- Milvus (port 19530)
-- MinIO (host port 9002 → container 9000, console on 9001)
-- Etcd (metadata store for Milvus)
 
 ---
 
@@ -225,15 +211,14 @@ curl http://localhost:8000/readyz
 # {"status": "ok"}
 ```
 
-#### Insert a Face
+#### Verify a Face (1:1)
 
-Register a new face with an ID and tenant:
+Compare a live photo against a reference image supplied as an S3 URL. Nothing is persisted.
 
 ```bash
-curl -X POST http://localhost:8000/v1/faces/insert \
-  -F "id=employee_001" \
-  -F "tenant=acme_corp" \
-  -F "file=@face.jpg"
+curl -X POST http://localhost:8000/v1/faces/verify \
+  -F "file=@live.jpg" \
+  -F "s3_url=https://your-bucket.s3.amazonaws.com/ref.jpg?X-Amz-Signature=..."
 ```
 
 **Response:**
@@ -243,83 +228,37 @@ curl -X POST http://localhost:8000/v1/faces/insert \
   "requestId": "a1b2c3d4-e5f6-...",
   "imageQualityAssessment": {
     "passed": true,
-    "nudity": {"is_safe": true, "probability": 0.02},
-    "spoof": {"is_spoof": false, "probability": 0.05},
-    "blur": {"is_sharp": true, "probability": 0.10}
+    "nsfw": {"is_safe": true, "probability": 1.0},
+    "spoof": {"is_live": true, "probability": 1.0},
+    "blur": {"is_sharp": true, "probability": 0.85}
   },
-  "userOperationResult": {
-    "operation": "INSERT",
-    "status": "success"
-  }
+  "verificationResult": {
+    "isMatch": true,
+    "score": 0.91,
+    "threshold": 0.5
+  },
+  "faceDetected": true,
+  "iqaPassed": true
 }
 ```
 
 **Parameters:**
 
-- `id` (required) — unique face identifier
-- `tenant` (required) — tenant namespace for isolation
-- `file` (required) — JPEG/PNG image file (max 5 MB)
-- Returns `409 Conflict` if a face with the same `id` already exists
-- Returns `422 Unprocessable Entity` if IQA fails or no face detected
+- `file` (required, form) — live photo upload (JPEG/PNG, max 5 MB)
+- `s3_url` (required, form) — presigned/public URL of the reference image
+- `threshold` (optional, form) — cosine match threshold; defaults to `ZEPIRIS_VERIFY_THRESHOLD` (0.5)
+- Returns `200 OK` with flags (and `score: null`) on early exit — live-photo decode failure, liveness failure, IQA not passed, or no face in the live photo
+- Returns `400 Bad Request` for reference-image problems: `reference_image_fetch_failed`, `reference_image_decode_failed`, `reference_face_not_detected`
 
-#### Search Similar Faces
+See [docs/API_REFERENCE.md](docs/API_REFERENCE.md) for every early-exit and error variant.
 
-Upload an image and find matching faces in the database:
+#### Detect a Face (UI poll)
 
-```bash
-curl -X POST "http://localhost:8000/v1/faces/search?top_k=5" \
-  -F "id=query_001" \
-  -F "tenant=acme_corp" \
-  -F "file=@query_face.jpg"
-```
-
-**Response:**
-
-```json
-{
-  "requestId": "d4e5f6a7-b8c9-...",
-  "imageQualityAssessment": {
-    "passed": true,
-    "nudity": {"is_safe": true, "probability": 0.01},
-    "spoof": {"is_spoof": false, "probability": 0.03},
-    "blur": {"is_sharp": true, "probability": 0.08}
-  },
-  "searchResult": {
-    "matches": [
-      {"id": "employee_001", "score": 0.92}
-    ]
-  }
-}
-```
-
-**Parameters:**
-
-- `id` (required, form) — identifier for this query
-- `tenant` (required, form) — tenant namespace
-- `file` (required, form) — JPEG/PNG image file
-- `top_k` (optional, query, default: 5) — number of matches to return
-- `threshold` (optional, query) — minimum similarity score; defaults to `ZEPIRIS_MILVUS_SEARCH_THRESHOLD`
-- Returns `200 OK` with empty `matches` array if IQA fails or no face detected
-
-#### Upsert a Face
-
-Insert or update a face record:
+Lightweight face-presence check used by the verify UI capture ring:
 
 ```bash
-curl -X POST http://localhost:8000/v1/faces/upsert \
-  -F "id=employee_001" \
-  -F "tenant=acme_corp" \
-  -F "file=@updated_face.jpg"
-```
-
-**Response:** Same structure as Insert, with `"operation": "UPSERT"`.
-
-#### Delete a Face
-
-Remove a face record by ID:
-
-```bash
-curl -X DELETE "http://localhost:8000/v1/faces/delete?id=employee_001"
+curl -X POST http://localhost:8000/v1/faces/detect \
+  -F "file=@frame.jpg"
 ```
 
 **Response:**
@@ -327,30 +266,13 @@ curl -X DELETE "http://localhost:8000/v1/faces/delete?id=employee_001"
 ```json
 {
   "requestId": "f6a7b8c9-d0e1-...",
-  "userOperationResult": {
-    "operation": "DELETE",
-    "status": "success"
-  }
+  "faceDetected": true
 }
 ```
 
-#### Get Face Metadata
+#### Verify UI
 
-Retrieve a face record by ID:
-
-```bash
-curl http://localhost:8000/v1/faces/get/employee_001
-```
-
-**Response:**
-
-```json
-{
-  "face_id": "employee_001",
-  "tenant": "acme_corp",
-  "object_key": "faces/employee_001"
-}
-```
+A single-page verify UI is served at [http://localhost:8000/ui](http://localhost:8000/ui).
 
 ### ML Inference API (`/v1/`)
 
@@ -480,23 +402,6 @@ curl -X POST http://localhost:8001/v1/assess \
 
 ---
 
-## Database Schema
-
-**Collection:** `zepiris_faces` (Milvus)
-
-
-| Field        | Type              | Purpose               |
-| ------------ | ----------------- | --------------------- |
-| `face_id`    | VARCHAR(128)      | Primary key           |
-| `tenant`     | VARCHAR(256)      | Multi-tenancy support |
-| `object_key` | VARCHAR(512)      | MinIO image path      |
-| `embedding`  | FLOAT_VECTOR(512) | Face embedding vector |
-
-
-**Index:** FLAT with COSINE similarity metric.
-
----
-
 ## Configuration
 
 ### Environment Variables
@@ -512,16 +417,9 @@ Copy `.env.example` to `.env` and customize. All settings use environment variab
 | `ZEPIRIS_API_VERSION` | `1.0.0` | API version (OpenAPI `info.version`) |
 | `ZEPIRIS_API_HOST` | `0.0.0.0` | Bind host |
 | `ZEPIRIS_API_PORT` | `8000` | Bind port |
-| `ZEPIRIS_MINIO_ENDPOINT` | `localhost:9002` | MinIO S3 host:port |
-| `ZEPIRIS_MINIO_ACCESS_KEY` | `minioadmin` | MinIO access key |
-| `ZEPIRIS_MINIO_SECRET_KEY` | `minioadmin` | MinIO secret key |
-| `ZEPIRIS_MINIO_BUCKET` | `zepiris` | S3 bucket name |
-| `ZEPIRIS_MINIO_SECURE` | `false` | Use TLS for MinIO |
-| `ZEPIRIS_MILVUS_HOST` | `localhost` | Milvus vector database host |
-| `ZEPIRIS_MILVUS_PORT` | `19530` | Milvus port |
-| `ZEPIRIS_MILVUS_COLLECTION` | `zepiris_faces` | Milvus collection name |
-| `ZEPIRIS_MILVUS_EMBEDDING_DIM` | `512` | Face embedding dimension |
-| `ZEPIRIS_MILVUS_SEARCH_THRESHOLD` | `0.5` | Default COSINE similarity threshold for search |
+| `ZEPIRIS_VERIFY_THRESHOLD` | `0.5` | Default COSINE similarity match threshold for verify |
+| `ZEPIRIS_REFERENCE_FETCH_TIMEOUT_SECONDS` | `10.0` | HTTP timeout (s) when fetching the reference image from `s3_url` |
+| `ZEPIRIS_REFERENCE_MAX_BYTES` | `5242880` | Max size (bytes, 5 MB) of the fetched reference image |
 | `ZEPIRIS_ML_INFERENCE_SERVICE_URL` | *(required)* | URL of the ML inference service (e.g. `http://localhost:8001`) |
 
 > **Note:** `ZEPIRIS_ML_INFERENCE_SERVICE_URL` is **required**. The main API will not start without it. Set it to `http://ml-inference:8001` in Docker Compose or `http://localhost:8001` when running locally.
@@ -580,18 +478,18 @@ zepiris/
 ├── .env.example                # Environment variable template
 ├── Dockerfile                  # Main service container
 ├── ml_inference.Dockerfile     # ML service container
-├── docker-compose.yml          # All services (MinIO, Etcd, Milvus, ML, API)
+├── docker-compose.yml          # 2 services (api, ml-inference)
 │
 ├── zepiris/
 │   ├── main.py                 # Main FastAPI app factory + lifespan
 │   ├── config.py               # Pydantic settings (ZEPIRIS_* prefix)
 │   ├── deps.py                 # FastAPI dependency injection
-│   ├── exceptions.py           # Domain exceptions (DuplicateFaceIdError, etc.)
+│   ├── exceptions.py           # Domain exceptions (ReferenceImageError, etc.)
 │   ├── exception_handlers.py   # Error response formatting
 │   │
 │   ├── api/routes/
 │   │   ├── __init__.py         # build_api_router()
-│   │   ├── face.py             # /v1/faces/ search, insert, upsert, delete, get
+│   │   ├── face.py             # /v1/faces/ verify, detect
 │   │   └── health.py           # GET /healthz, /readyz
 │   │
 │   ├── ml_inference/
@@ -609,12 +507,12 @@ zepiris/
 │   ├── services/
 │   │   ├── embedding.py        # FaceEmbeddingProvider (ABC) + MLInferenceEmbeddingService
 │   │   ├── iqa.py              # MLInferenceIQAService → HTTP /v1/assess
-│   │   ├── milvus_store.py     # MilvusFaceStore (vector CRUD + search)
-│   │   ├── minio_storage.py    # MinioStorageService (S3 storage)
+│   │   ├── s3_fetcher.py       # S3ImageFetcher: fetch reference image from s3_url (plain HTTP)
+│   │   ├── similarity.py       # In-process cosine similarity
 │   │   └── ml_client.py        # MLInferenceClient (httpx, sync)
 │   │
 │   └── schemas/
-│       ├── face.py             # SearchResponse, UpsertResponse, DeleteResponse
+│       ├── face.py             # VerifyResponse, DetectResponse
 │       └── ml_inference.py     # FaceEmbeddingResult, IQA result schemas
 │
 └── models/                     # Pre-trained model weights
@@ -722,18 +620,23 @@ poetry install
 
 ### Service Connection Issues
 
-**Problem:** Main API can't connect to Milvus or MinIO
+**Problem:** Main API can't reach the ML inference service
 
-**Solution:** Verify external services are running:
+**Solution:** Verify the ml-inference container is running and healthy:
 
 ```bash
-# Check all services
+# Check both services
 docker compose ps
 
-# Or check individually
-curl http://localhost:9002/minio/health/live  # MinIO (host port 9002)
+# Check ML inference directly
 curl http://localhost:8001/healthz             # ML inference
 ```
+
+**Problem:** Verify returns `reference_image_fetch_failed`
+
+**Solution:** The `s3_url` may be expired, unreachable, returned 404, exceeded
+`ZEPIRIS_REFERENCE_MAX_BYTES`, or timed out (`ZEPIRIS_REFERENCE_FETCH_TIMEOUT_SECONDS`).
+Re-generate a fresh presigned URL or raise the timeout.
 
 **Problem:** Main API fails to start with "ML_INFERENCE_SERVICE_URL required"
 
@@ -798,9 +701,8 @@ poetry add torch torchvision --platform linux --python "^3.10"
 ### Additional Resources
 
 - [InsightFace Documentation](https://github.com/deepinsight/insightface) — Face embedding & detection
-- [Milvus Vector Database](https://milvus.io/docs) — Vector storage & search
-- [MinIO S3 SDK](https://min.io/docs/minio/kubernetes/upstream/) — Object storage
 - [FastAPI Best Practices](https://fastapi.tiangolo.com/deployment/concepts/) — Web framework
+- [HTTPX Documentation](https://www.python-httpx.org/) — Async/sync HTTP client
 
 ---
 
@@ -832,10 +734,9 @@ If you use ZepIris in research or production, please cite:
 ZepIris stands on the shoulders of excellent open-source projects:
 
 - **[InsightFace](https://github.com/deepinsight/insightface)** — State-of-the-art face embedding models
-- **[Milvus](https://milvus.io/)** — High-performance vector database
 - **[FastAPI](https://fastapi.tiangolo.com/)** — Modern async Python web framework
 - **[PyTorch](https://pytorch.org/)** — Deep learning framework
-- **[MinIO](https://min.io/)** — S3-compatible object storage
+- **[HTTPX](https://www.python-httpx.org/)** — HTTP client for service-to-service calls
 
 ---
 

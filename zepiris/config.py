@@ -20,17 +20,9 @@ class Settings(BaseSettings):
     api_host: str = "0.0.0.0"
     api_port: int = 8000
 
-    minio_endpoint: str = Field(default="localhost:9002", description="host:port")
-    minio_access_key: str = "minioadmin"
-    minio_secret_key: str = "minioadmin"
-    minio_bucket: str = "zepiris"
-    minio_secure: bool = False
-
-    milvus_host: str = "localhost"
-    milvus_port: int = 19530
-    milvus_collection: str = "zepiris_faces"
-    milvus_embedding_dim: int = 512
-    milvus_search_threshold: float = 0.5
+    verify_threshold: float = 0.5
+    reference_fetch_timeout_seconds: float = 10.0
+    reference_max_bytes: int = 5 * 1024 * 1024  # mirrors MAX_IMAGE_SIZE_BYTES
 
     #: Required. ML inference base URL; IQA uses POST /v1/iqa/assess, embeddings POST /v1/face/embed.
     #: Also accepts legacy env ML_INFERENCE_SERVICE_URL (no ZEPIRIS_ prefix) if this is unset.
