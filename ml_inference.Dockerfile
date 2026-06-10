@@ -44,7 +44,8 @@ RUN apt-get update \
 COPY models/ /app/models/
 
 RUN useradd --uid 1000 --create-home --shell /usr/sbin/nologin appuser \
-    && chown -R appuser:appuser /app
+    && mkdir -p /home/appuser/.insightface \
+    && chown -R appuser:appuser /app /home/appuser/.insightface
 
 USER appuser
 

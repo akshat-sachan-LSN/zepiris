@@ -20,6 +20,18 @@ services:
       ML_SERVICE_SPOOF_LOCAL_MODEL_PATH: "/app/models/spoof_model.pth"
       ML_SERVICE_BLUR_MODEL_SOURCE: "auto"
       ML_SERVICE_BLUR_LOCAL_MODEL_PATH: "/app/models/blur_model.pth"
+      # Face recognition model. "buffalo_l" (ResNet50) loads reliably and is the
+      # default. "antelopev2" is more accurate but fails to load with this image's
+      # InsightFace/onnxruntime build, so it falls back to buffalo_l anyway.
+      ML_SERVICE_FACE_MODEL_NAME: "buffalo_l"
+      # Detector confidence; 0.5 = cleanest crops/best scores. Lower (e.g. 0.3)
+      # only if small/printed document faces are being missed.
+      ML_SERVICE_FACE_DET_THRESH: "0.5"
+      # Fallback detection for hard faces (documents): used only when the primary
+      # pass finds nothing, then a lower threshold + an upscaled retry kick in.
+      ML_SERVICE_FACE_LOW_DET_THRESH: "0.3"
+      ML_SERVICE_FACE_ENABLE_UPSCALE_RETRY: "true"
+      ML_SERVICE_FACE_UPSCALE_FACTOR: "2.0"
     volumes:
       # Persist the InsightFace buffalo_l weights (~300MB) downloaded on first
       # startup, so container recreates don't re-download them every time.

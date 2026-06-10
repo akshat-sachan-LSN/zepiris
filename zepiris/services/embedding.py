@@ -6,10 +6,39 @@ from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING
 
 import cv2
+import httpx
 import numpy as np
 
-from zepiris.exceptions import ImageEncodeError
+from zepiris.exceptions import (
+    ImageEncodeError,
+    MLInferenceTimeoutError,
+    MLInferenceTransportError,
+    MLInferenceUpstreamError,
+)
 from zepiris.schemas.ml_inference import FaceDetectionResult, FaceEmbeddingResult
+
+
+def _wrap_ml_errors(call):
+    """Run an ML-client call, converting httpx errors into ZepIris service errors.
+
+    Without this, a failing ML request (e.g. the recognition model not loaded ->
+    503) raises a raw ``httpx.HTTPStatusError`` that escapes as a bare HTTP 500
+    "Internal Server Error". This surfaces a clear, structured message instead.
+    """
+    try:
+        return call()
+    except httpx.HTTPStatusError as e:
+        detail: dict = {"message": "ml_inference_request_failed", "upstream_status": e.response.status_code}
+        try:
+            detail["upstream"] = e.response.json()
+        except Exception:
+            detail["upstream"] = e.response.text[:2000]
+        status = 503 if e.response.status_code == 503 else 502
+        raise MLInferenceUpstreamError(status_code=status, detail=detail) from e
+    except httpx.TimeoutException as e:
+        raise MLInferenceTimeoutError() from e
+    except httpx.HTTPError as e:
+        raise MLInferenceTransportError(str(e)) from e
 
 if TYPE_CHECKING:
     from zepiris.services.ml_client import MLInferenceClient
@@ -78,11 +107,11 @@ class MLInferenceEmbeddingService(FaceEmbeddingProvider):
         if not ok:
             raise ImageEncodeError()
         image_b64 = base64.b64encode(buf.tobytes()).decode("utf-8")
-        return self._client.embed_face(image_b64)
+        return _wrap_ml_errors(lambda: self._client.embed_face(image_b64))
 
     def detect_box(self, image_bgr: np.ndarray) -> FaceDetectionResult:
         ok, buf = cv2.imencode(".jpg", image_bgr)
         if not ok:
             raise ImageEncodeError()
         image_b64 = base64.b64encode(buf.tobytes()).decode("utf-8")
-        return self._client.detect_face(image_b64)
+        return _wrap_ml_errors(lambda: self._client.detect_face(image_b64))

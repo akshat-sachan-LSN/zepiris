@@ -24,11 +24,15 @@ class VerificationResult(BaseModel):
 
 
 class VerifyResponse(BaseModel):
-    """Response for the stateless 1:1 verify endpoint."""
+    """Response for the stateless 1:1 verify endpoint.
+
+    ``image_quality_assessment`` is null for pure image-to-image (S3↔S3) matches,
+    where liveness/quality gating is skipped because neither side is a live capture.
+    """
 
     request_id: str = Field(..., alias="requestId")
-    image_quality_assessment: ImageQualityAssessmentResult = Field(
-        ..., alias="imageQualityAssessment"
+    image_quality_assessment: ImageQualityAssessmentResult | None = Field(
+        None, alias="imageQualityAssessment"
     )
     verification_result: VerificationResult = Field(..., alias="verificationResult")
     face_detected: bool = Field(..., alias="faceDetected")

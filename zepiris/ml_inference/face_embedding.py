@@ -1,13 +1,20 @@
-"""Face embedding service using InsightFace (buffalo_l)."""
+"""Face embedding service using InsightFace (antelopev2 / buffalo_l)."""
 
 from __future__ import annotations
 
+import logging
+import os
+import shutil
+
+import cv2
 import numpy as np
 from insightface.app import FaceAnalysis
 from insightface.app.common import Face
 
 from zepiris.ml_inference.base import ModelService, ModelServiceConfig
 from zepiris.schemas.ml_inference import FaceDetectionResult, FaceEmbeddingResult
+
+logger = logging.getLogger(__name__)
 
 
 class FaceEmbeddingService(ModelService):
@@ -27,11 +34,17 @@ class FaceEmbeddingService(ModelService):
         device: str = "cpu",
         enable_padding_retry: bool = True,
         padding_fraction: float = 0.25,
+        model_name: str = "buffalo_l",
+        det_thresh: float = 0.5,
+        low_det_thresh: float = 0.3,
+        enable_upscale_retry: bool = True,
+        upscale_factor: float = 2.0,
+        upscale_max_side: int = 2000,
     ) -> None:
         """Initialize face embedding service.
 
         Args:
-            embedding_dim: Expected embedding dimension (default 512 for buffalo_l)
+            embedding_dim: Expected embedding dimension (512 for buffalo_l/antelopev2)
             detection_size: Face detection size as (width, height) tuple
             facial_area_threshold: Minimum face area as fraction of image area
             device: Inference device ("cpu" or "cuda")
@@ -42,12 +55,29 @@ class FaceEmbeddingService(ModelService):
                 restores that margin.
             padding_fraction: Border width added on each side during the retry,
                 expressed as a fraction of the image's larger dimension.
+            model_name: InsightFace model pack. "antelopev2" (glintr100/ResNet100,
+                Glint360K) is more accurate than "buffalo_l" (w600k_r50/ResNet50);
+                both produce 512-d embeddings. Slower per call on CPU.
+            det_thresh: Primary detector confidence (0.5 = clean, well-aligned crops).
+            low_det_thresh: Fallback confidence used only when the primary pass finds
+                no face — recovers small/printed/low-contrast faces (e.g. the photo on
+                an Aadhaar/PAN document) at the cost of accepting weaker detections.
+            enable_upscale_retry: If True, when no face is found, retry on an upscaled
+                copy of the image. Small document faces detect far better when enlarged.
+            upscale_factor: How much to enlarge on the upscale retry.
+            upscale_max_side: Cap the longer side after upscaling (avoid huge images).
         """
         self._embedding_dim = embedding_dim
         self._detection_size = detection_size
         self._facial_area_threshold = facial_area_threshold
         self._enable_padding_retry = enable_padding_retry
         self._padding_fraction = padding_fraction
+        self._model_name = model_name
+        self._det_thresh = det_thresh
+        self._low_det_thresh = low_det_thresh
+        self._enable_upscale_retry = enable_upscale_retry
+        self._upscale_factor = upscale_factor
+        self._upscale_max_side = upscale_max_side
         self._face_app: FaceAnalysis | None = None
         config = ModelServiceConfig(
             model_name="face_embedding",
@@ -65,29 +95,89 @@ class FaceEmbeddingService(ModelService):
             return self._face_app
 
         ctx_id = 0 if self.config.device != "cpu" else -1
-        app = FaceAnalysis(name="buffalo_l")
-        app.prepare(ctx_id=ctx_id, det_size=self._detection_size)
-        app.models = {k: v for k, v in app.models.items() if k in ("detection", "recognition")}
+
+        def _prepare(name: str) -> FaceAnalysis:
+            app = FaceAnalysis(name=name)
+            app.prepare(ctx_id=ctx_id, det_size=self._detection_size, det_thresh=self._det_thresh)
+            app.models = {k: v for k, v in app.models.items() if k in ("detection", "recognition")}
+            return app
+
+        try:
+            app = _prepare(self._model_name)
+        except Exception:
+            if self._model_name == "buffalo_l":
+                raise
+            # A partial/corrupt download (e.g. an interrupted antelopev2) leaves the
+            # model folder present but incomplete, so InsightFace skips re-downloading
+            # and then asserts 'detection' missing. Wipe the cache and retry a CLEAN
+            # download once; only fall back to buffalo_l if that also fails.
+            logger.warning(
+                "Face model %r failed to load; clearing its cache and re-downloading",
+                self._model_name,
+                exc_info=True,
+            )
+            self._clear_model_cache(self._model_name)
+            try:
+                app = _prepare(self._model_name)
+            except Exception:
+                logger.warning(
+                    "Face model %r still failed after a clean download; falling back to buffalo_l",
+                    self._model_name,
+                    exc_info=True,
+                )
+                app = _prepare("buffalo_l")
 
         self._face_app = app
         return self._face_app
 
-    def _select_face(self, image_rgb: np.ndarray) -> Face | None:
-        """Detect faces in an image and select the most central qualifying one.
+    @staticmethod
+    def _clear_model_cache(name: str) -> None:
+        """Remove a model pack's cached folder + zip so it re-downloads cleanly.
+
+        Mirrors InsightFace's cache location (``$INSIGHTFACE_HOME`` or
+        ``~/.insightface``); safe to call even if nothing is there.
+        """
+        root = os.environ.get(
+            "INSIGHTFACE_HOME", os.path.join(os.path.expanduser("~"), ".insightface")
+        )
+        models_dir = os.path.join(root, "models")
+        shutil.rmtree(os.path.join(models_dir, name), ignore_errors=True)
+        try:
+            os.remove(os.path.join(models_dir, f"{name}.zip"))
+        except OSError:
+            pass
+
+    def _select_face(self, image_rgb: np.ndarray, det_thresh: float | None = None) -> Face | None:
+        """Detect faces and select the best one for recognition.
+
+        Picks the **largest** qualifying face (most pixels → best alignment and
+        embedding quality), breaking ties by detector confidence. This beats a
+        "most central" rule: the dominant face is almost always the subject, and
+        a bigger crop yields a more discriminative embedding (higher match scores).
+
+        ``det_thresh`` temporarily overrides the detector confidence for this call
+        (used by the fallback cascade to recover hard/document faces).
 
         Returns the chosen ``Face`` (detection + keypoints) or ``None`` when the
         detector finds nothing.
         """
         app = self.load_model()
 
-        bboxes, kpss = app.det_model.detect(image_rgb, max_num=0, metric="default")
+        if det_thresh is not None and hasattr(app.det_model, "det_thresh"):
+            prev = app.det_model.det_thresh
+            app.det_model.det_thresh = det_thresh
+            try:
+                bboxes, kpss = app.det_model.detect(image_rgb, max_num=0, metric="default")
+            finally:
+                app.det_model.det_thresh = prev
+        else:
+            bboxes, kpss = app.det_model.detect(image_rgb, max_num=0, metric="default")
 
         if len(bboxes) == 0:
             return None
 
         h, w = image_rgb.shape[:2]
         img_area = h * w
-        img_center = np.array([w / 2.0, h / 2.0])
 
         filtered_indices = []
         for i, box in enumerate(bboxes):
@@ -98,14 +188,18 @@ class FaceEmbeddingService(ModelService):
 
         candidates = filtered_indices if filtered_indices else list(range(len(bboxes)))
 
-        selected_idx = 0
-        min_dist = float("inf")
-        for i in candidates:
+        def _rank(i: int) -> tuple[float, float]:
             x1, y1, x2, y2 = bboxes[i][:4]
-            center = np.array([(x1 + x2) / 2.0, (y1 + y2) / 2.0])
-            dist = np.linalg.norm(center - img_center)
-            if dist < min_dist:
-                min_dist = dist
+            area = float((x2 - x1) * (y2 - y1))
+            score = float(bboxes[i][4]) if bboxes.shape[1] > 4 else 0.0
+            return (area, score)
+
+        selected_idx = 0
+        best_rank = (-1.0, -1.0)
+        for i in candidates:
+            rank = _rank(i)
+            if rank > best_rank:
+                best_rank = rank
                 selected_idx = i
 
         return Face(
@@ -126,29 +220,62 @@ class FaceEmbeddingService(ModelService):
             mode="reflect",
         )
 
+    def _upscale_image(self, image_rgb: np.ndarray) -> np.ndarray:
+        """Enlarge the image so small/printed faces (e.g. on documents) detect better."""
+        h, w = image_rgb.shape[:2]
+        factor = self._upscale_factor
+        longer = max(h, w) * factor
+        if longer > self._upscale_max_side:  # don't blow up huge scans
+            factor = self._upscale_max_side / float(max(h, w))
+        if factor <= 1.0:
+            return image_rgb
+        return cv2.resize(
+            image_rgb, (int(round(w * factor)), int(round(h * factor))), interpolation=cv2.INTER_CUBIC
+        )
+
     def preprocess(self, image_rgb: np.ndarray) -> dict:
-        """Detect faces and select the most central face above area threshold.
+        """Detect a face with a fallback cascade, returning the image to embed on.
 
-        If the first detection pass finds nothing and ``enable_padding_retry`` is
-        set, the image is reflect-padded and detection is retried. Recognition then
-        runs on the padded image so the embedding keeps full facial context.
+        Tries progressively harder so small/printed faces (documents) are recovered
+        while clean selfies still resolve on the first, highest-quality pass:
 
-        Args:
-            image_rgb: Input image in RGB format, shape (H, W, 3), dtype uint8
+          1. original image @ primary det_thresh        (best alignment, selfies)
+          2. original image @ low det_thresh             (weak/low-contrast faces)
+          3. reflect-padded image @ low det_thresh       (frame-filling/edge faces)
+          4. upscaled image @ low det_thresh             (small document photos)
+
+        Recognition runs on whichever image produced the detection, so the face
+        bbox/keypoints stay in the right coordinate space.
 
         Returns:
             dict: {"image": image used for recognition, "face": Face or None}
         """
+        # 1. primary pass — clean, well-aligned (covers normal selfies/photos)
         face = self._select_face(image_rgb)
         if face is not None:
             return {"image": image_rgb, "face": face}
 
+        # 2. lower the confidence threshold on the original
+        if self._low_det_thresh < self._det_thresh:
+            face = self._select_face(image_rgb, det_thresh=self._low_det_thresh)
+            if face is not None:
+                return {"image": image_rgb, "face": face}
+
+        # 3. reflect-pad (restores margin for frame-filling / border-touching faces)
         if self._enable_padding_retry:
             padded = self._pad_image(image_rgb)
             if padded is not image_rgb:
-                face = self._select_face(padded)
+                face = self._select_face(padded, det_thresh=self._low_det_thresh)
                 if face is not None:
                     return {"image": padded, "face": face}
+
+        # 4. upscale (small printed document faces detect far better enlarged)
+        if self._enable_upscale_retry:
+            upscaled = self._upscale_image(image_rgb)
+            if upscaled is not image_rgb:
+                face = self._select_face(upscaled, det_thresh=self._low_det_thresh)
+                if face is not None:
+                    return {"image": upscaled, "face": face}
 
         return {"image": image_rgb, "face": None}
 

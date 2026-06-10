@@ -88,6 +88,21 @@ class MLServiceSettings(BaseSettings):
     face_area_threshold: float = 0.01
     face_enable_padding_retry: bool = True
     face_padding_fraction: float = 0.25
+    # Recognition model pack. "buffalo_l" (ResNet50, w600k) loads reliably via
+    # InsightFace auto-download and is the default. "antelopev2" (ResNet100) is
+    # more accurate in theory but fails to load with this InsightFace/onnxruntime
+    # build ("assert 'detection'"), so it is not used unless that's resolved.
+    face_model_name: str = "buffalo_l"
+    # Detector confidence. 0.5 (InsightFace default) gives clean, well-aligned
+    # crops => best match scores. Lower it (e.g. 0.3) only if small/printed
+    # document faces are being missed entirely.
+    face_det_thresh: float = 0.5
+    # Fallback confidence used only when the primary pass finds no face — recovers
+    # small/printed document faces (Aadhaar/PAN) without hurting normal selfies.
+    face_low_det_thresh: float = 0.3
+    # Retry detection on an upscaled copy when no face is found (helps tiny doc faces).
+    face_enable_upscale_retry: bool = True
+    face_upscale_factor: float = 2.0
 
 
 @lru_cache
@@ -131,6 +146,11 @@ async def lifespan(app: FastAPI):
             device=device,
             enable_padding_retry=s.face_enable_padding_retry,
             padding_fraction=s.face_padding_fraction,
+            model_name=s.face_model_name,
+            det_thresh=s.face_det_thresh,
+            low_det_thresh=s.face_low_det_thresh,
+            enable_upscale_retry=s.face_enable_upscale_retry,
+            upscale_factor=s.face_upscale_factor,
         )
         app.state.face_embedding_service.load_model()
     except Exception:

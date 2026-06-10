@@ -21,6 +21,9 @@ class Settings(BaseSettings):
     api_port: int = 8000
 
     verify_threshold: float = 0.5
+    # Documents (Aadhaar/PAN) carry small/printed photos that embed weaker, so
+    # the doc-match endpoint defaults to a more lenient threshold than face-match.
+    doc_verify_threshold: float = 0.4
     reference_fetch_timeout_seconds: float = 10.0
     reference_max_bytes: int = 5 * 1024 * 1024  # mirrors MAX_IMAGE_SIZE_BYTES
 

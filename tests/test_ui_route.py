@@ -13,4 +13,5 @@ def test_ui_page_renders_single_mode() -> None:
     html = r.text
     assert "s3_url" in html or "S3 URL" in html
     assert "Save to DB" not in html
-    assert "/v1/faces/verify" in html
+    assert "/v1/faces/facematch/verify" in html
+    assert "/v1/faces/docmatch/verify" in html

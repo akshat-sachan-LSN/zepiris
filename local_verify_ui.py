@@ -1,66 +1,48 @@
-"""Single-mode face verification UI and the face-detection poll endpoint.
+#!/usr/bin/env python3
+"""Local face-verify UI that talks to a REMOTE ZepIris API (e.g. the EC2 box).
 
-GET  /ui                 the verify page (upload/camera live photo + S3 reference URL)
-POST /v1/faces/detect    face-present poll for the on-screen readiness ring
-(Verification itself is POST /v1/faces/verify in face.py.)
+Why this exists: a browser page opened locally cannot call the EC2 API directly
+(CORS blocks cross-origin fetch, and the API sends no CORS headers). This script
+serves the UI from localhost AND proxies the verify request to the remote API, so
+the browser only ever talks to localhost — no CORS, and the camera works too
+(localhost is a "secure origin").
+
+Usage:
+    python3 local_verify_ui.py
+    # then open http://localhost:8090/
+
+Point it at a different backend / port:
+    ZEPIRIS_API=http://65.0.4.214:8000 PORT=8090 python3 local_verify_ui.py
+
+No dependencies — Python 3 standard library only.
 """
 
 from __future__ import annotations
 
-import logging
+import os
+import urllib.error
+import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-import cv2
-import numpy as np
-from fastapi import APIRouter, File, UploadFile
-from fastapi.responses import HTMLResponse
+BACKEND = os.environ.get("ZEPIRIS_API", "http://65.0.4.214:8000").rstrip("/")
+PORT = int(os.environ.get("PORT", "8090"))
 
-from zepiris.deps import EmbeddingDep
-
-router = APIRouter()
-logger = logging.getLogger(__name__)
-
-
-@router.post("/v1/faces/detect")
-async def detect_face(
-    embedding_svc: EmbeddingDep,
-    file: UploadFile = File(...),
-) -> dict:
-    """Fast poll for the UI ring: is a face visible, and where?"""
-    raw = await file.read()
-    if not raw:
-        return {"faceDetected": False, "bbox": [0, 0, 0, 0]}
-    arr = np.frombuffer(raw, dtype=np.uint8)
-    image_bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-    if image_bgr is None:
-        return {"faceDetected": False, "bbox": [0, 0, 0, 0]}
-    image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
-    try:
-        result = embedding_svc.detect_box(image_rgb)
-    except Exception:
-        return {"faceDetected": False, "bbox": [0, 0, 0, 0]}
-    return {"faceDetected": bool(result.face_detected), "bbox": result.bbox}
-
-
-@router.get("/ui", response_class=HTMLResponse)
-async def ui_page() -> HTMLResponse:
-    return HTMLResponse(_PAGE)
-
-
-_PAGE = """<!DOCTYPE html>
+PAGE = """<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>ZepIris · Verify</title>
+<title>ZepIris · Verify (local)</title>
 <style>
   :root{--bg:#0b0f17;--panel:#121826;--line:#1f2937;--muted:#8b97a7;
-    --text:#e8edf4;--accent:#5b8cff;--ok:#1fbf75;--no:#ff5d6c;--warn:#e3b341;}
+    --text:#e8edf4;--accent:#5b8cff;--ok:#1fbf75;--no:#ff5d6c;}
   *{box-sizing:border-box}
   body{margin:0;font:15px/1.5 ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
     background:radial-gradient(1200px 600px at 50% -10%,#16203a,var(--bg));color:var(--text);min-height:100vh}
   .wrap{max-width:820px;margin:0 auto;padding:28px 20px 64px}
   h1{font-size:22px;margin:0 0 2px}
   .sub{color:var(--muted);margin:0 0 20px;font-size:13px}
+  .be{color:var(--accent)}
   .grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}
   @media(max-width:680px){.grid{grid-template-columns:1fr}}
   .card{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:20px;margin-bottom:18px}
@@ -79,7 +61,7 @@ _PAGE = """<!DOCTYPE html>
   button.secondary{background:#222c40}
   button:disabled{opacity:.45;cursor:not-allowed}
   .note{color:var(--muted);font-size:13px;margin:12px 0 0}
-  .err{color:var(--no)} .good{color:var(--ok)}
+  .err{color:var(--no)}
   .verdict{font-size:30px;font-weight:800;margin:4px 0 2px;text-align:center}
   .verdict.match{color:var(--ok)} .verdict.nomatch{color:var(--no)}
   .bar{height:10px;border-radius:6px;background:#0e1422;overflow:hidden;margin:14px 0 4px}
@@ -89,15 +71,14 @@ _PAGE = """<!DOCTYPE html>
   .pair img{width:200px;height:200px;object-fit:cover;border-radius:12px;border:1px solid var(--line);background:#000}
   figcaption{color:var(--muted);font-size:12px;margin-top:6px;text-align:center}
   .center{text-align:center}
-  details{margin-top:14px}
-  summary{cursor:pointer;color:var(--muted);font-size:13px}
+  details{margin-top:14px} summary{cursor:pointer;color:var(--muted);font-size:13px}
   pre{background:#0e1422;border:1px solid var(--line);border-radius:10px;padding:12px;overflow:auto;font-size:12px}
 </style>
 </head>
 <body>
 <div class="wrap">
-  <h1>ZepIris · Verify</h1>
-  <p class="sub">Upload a live photo and a reference (photo or ID document). Nothing is stored.</p>
+  <h1>ZepIris · Verify <small style="font-size:12px;color:var(--muted)">(local)</small></h1>
+  <p class="sub">Backend: <span class="be">__BACKEND__</span></p>
 
   <div class="card">
     <label>Mode</label>
@@ -108,7 +89,6 @@ _PAGE = """<!DOCTYPE html>
   </div>
 
   <div class="grid">
-    <!-- SELFIE -->
     <div class="card">
       <label>Selfie</label>
       <div class="row" style="margin:0 0 12px">
@@ -129,8 +109,6 @@ _PAGE = """<!DOCTYPE html>
       <input type="text" id="selfieUrl" placeholder="https://bucket.s3.region.amazonaws.com/selfie.jpg" autocomplete="off" style="display:none"/>
       <img id="livePrev" class="thumb" alt="selfie preview"/>
     </div>
-
-    <!-- REFERENCE -->
     <div class="card">
       <label id="refLabel">Reference face (photo)</label>
       <div class="row" style="margin:0 0 12px">
@@ -147,9 +125,7 @@ _PAGE = """<!DOCTYPE html>
   </div>
 
   <div class="card">
-    <div class="row">
-      <button id="verifyBtn" disabled>Verify</button>
-    </div>
+    <div class="row"><button id="verifyBtn" disabled>Verify</button></div>
     <p id="status" class="note"></p>
   </div>
 
@@ -239,98 +215,134 @@ $('modeUrl').addEventListener('click', () => setRefMode('url'));
 $('modeFile').addEventListener('click', () => setRefMode('file'));
 $('refDrop').addEventListener('click', () => $('refFileInput').click());
 $('refFileInput').addEventListener('change', e => { if(e.target.files[0]) setRefFile(e.target.files[0]); });
+setRefMode('url');
+setMatchMode('face');
+setSelfieMode('local');
 
-// --- file upload ---
 $('drop').addEventListener('click', () => $('fileInput').click());
 $('fileInput').addEventListener('change', e => { if(e.target.files[0]) setLive(e.target.files[0]); });
-$('drop').addEventListener('dragover', e => { e.preventDefault(); $('drop').style.borderColor = 'var(--accent)'; });
-$('drop').addEventListener('dragleave', () => { $('drop').style.borderColor = ''; });
-$('drop').addEventListener('drop', e => {
-  e.preventDefault(); $('drop').style.borderColor = '';
-  if(e.dataTransfer.files[0]) setLive(e.dataTransfer.files[0]);
-});
+$('drop').addEventListener('dragover', e => { e.preventDefault(); $('drop').style.borderColor='var(--accent)'; });
+$('drop').addEventListener('dragleave', () => { $('drop').style.borderColor=''; });
+$('drop').addEventListener('drop', e => { e.preventDefault(); $('drop').style.borderColor='';
+  if(e.dataTransfer.files[0]) setLive(e.dataTransfer.files[0]); });
 
-// --- reference URL preview ---
 $('s3url').addEventListener('input', () => {
-  const u = $('s3url').value.trim();
-  const p = $('refPrev');
-  if(u){ p.src = u; p.style.display = 'block'; } else { p.style.display = 'none'; }
+  const u = $('s3url').value.trim(); const p = $('refPrev');
+  if(u){ p.src = u; p.style.display='block'; } else { p.style.display='none'; }
   refreshBtn();
 });
 
-// --- optional camera (works on https or localhost) ---
 $('camBtn').addEventListener('click', async () => {
-  if(stream){ return; }
+  if(stream) return;
   try{
     stream = await navigator.mediaDevices.getUserMedia({video:{facingMode:'user'}, audio:false});
-    $('vid').srcObject = stream;
-    $('camWrap').style.display = 'block';
-    $('camBtn').style.display = 'none';
-  }catch(e){
-    $('status').innerHTML = '<span class="err">Camera unavailable (needs HTTPS or localhost): '+e.message+'. Use file upload instead.</span>';
-  }
+    $('vid').srcObject = stream; $('camWrap').style.display='block'; $('camBtn').style.display='none';
+  }catch(e){ $('status').innerHTML = '<span class="err">Camera unavailable: '+e.message+'. Use file upload.</span>'; }
 });
 $('snap').addEventListener('click', () => {
-  const v = $('vid'), c = $('scratch');
-  c.width = v.videoWidth; c.height = v.videoHeight;
-  c.getContext('2d').drawImage(v,0,0);
-  c.toBlob(b => setLive(b), 'image/jpeg', 0.92);
+  const v=$('vid'), c=$('scratch'); c.width=v.videoWidth; c.height=v.videoHeight;
+  c.getContext('2d').drawImage(v,0,0); c.toBlob(b=>setLive(b),'image/jpeg',0.92);
 });
 
-// --- verify ---
 $('verifyBtn').addEventListener('click', async () => {
-  if(!hasSelfie() || !hasRef()){ return; }
-  $('verifyBtn').disabled = true; $('status').textContent = 'Verifying…'; $('resultCard').style.display = 'none';
+  if(!hasSelfie() || !hasRef()) return;
+  $('verifyBtn').disabled = true; $('status').textContent='Verifying…'; $('resultCard').style.display='none';
   const fd = new FormData();
   // selfie: file upload OR S3 URL (S3 selfie => server skips liveness, pure image match)
   let selfieDisplay;
   if(selfieMode === 'url'){ selfieDisplay = $('selfieUrl').value.trim(); fd.append('selfie_s3_url', selfieDisplay); }
   else { selfieDisplay = liveURL; fd.append('file', liveBlob, 'live.jpg'); }
+  // reference / document: file upload OR S3 URL
   const fileField = matchMode === 'doc' ? 'document_file' : 'reference_file';
   const endpoint = matchMode === 'doc' ? '/v1/faces/docmatch/verify' : '/v1/faces/facematch/verify';
-  let url;
-  if(refMode === 'url'){ url = $('s3url').value.trim(); fd.append('s3_url', url); }
-  else { url = refURL; fd.append(fileField, refBlob, 'reference.jpg'); }
+  let refDisplay;
+  if(refMode === 'url'){ refDisplay = $('s3url').value.trim(); fd.append('s3_url', refDisplay); }
+  else { refDisplay = refURL; fd.append(fileField, refBlob, 'reference.jpg'); }
   try{
-    const r = await fetch(endpoint, {method:'POST', body:fd});
+    const r = await fetch(endpoint, {method:'POST', body:fd});  // proxied to backend
     const d = await r.json();
     if(!r.ok){
       $('status').innerHTML = '<span class="err">'+(d.detail?.message || d.detail || ('HTTP '+r.status))+'</span>';
-      $('raw').textContent = JSON.stringify(d, null, 2);
-      $('resultCard').style.display = 'block';
-      $('verdict').textContent = '✕ Error'; $('verdict').className = 'verdict nomatch';
-    } else {
-      showResult(selfieDisplay, url, d);
-    }
+      $('raw').textContent = JSON.stringify(d,null,2); $('resultCard').style.display='block';
+      $('verdict').textContent='✕ Error'; $('verdict').className='verdict nomatch';
+    } else { showResult(selfieDisplay, refDisplay, d); }
   }catch(e){ $('status').innerHTML = '<span class="err">Request failed: '+e.message+'</span>'; }
   $('verifyBtn').disabled = false;
 });
 
 function showResult(selfieUrl, url, d){
-  $('status').textContent = ''; $('resultCard').style.display = 'block';
-  $('liveImg').src = selfieUrl; $('refImg').src = url;
-  $('raw').textContent = JSON.stringify(d, null, 2);
+  $('status').textContent=''; $('resultCard').style.display='block';
+  $('liveImg').src = selfieUrl; $('refImg').src = url; $('raw').textContent = JSON.stringify(d,null,2);
   const v = $('verdict');
-  // iqaPassed===false alone is NOT a failure (expected for S3->S3 no-liveness matches).
-  if(d.decodeFailed || d.livenessFailed === true || d.faceDetected === false){
-    const reason = d.livenessFailed === true ? 'Liveness failed — looks like a photo/screen, not a live face'
-      : d.faceDetected === false ? 'No face detected in the selfie'
+  // iqaPassed===false alone is NOT a failure (it's expected for S3->S3 no-liveness matches).
+  if(d.decodeFailed || d.livenessFailed===true || d.faceDetected===false){
+    const reason = d.livenessFailed===true ? 'Liveness failed — looks like a photo/screen'
+      : d.faceDetected===false ? 'No face detected in the selfie'
       : 'Could not read the image';
-    v.textContent = '✕ ' + reason; v.className = 'verdict nomatch';
-    $('barFill').style.width = '0%'; $('scoreText').textContent = '';
-    return;
+    v.textContent='✕ '+reason; v.className='verdict nomatch';
+    $('barFill').style.width='0%'; $('scoreText').textContent=''; return;
   }
   const vr = d.verificationResult || {};
-  const pct = Math.max(0, Math.min(100, Math.round((vr.score ?? 0) * 100)));
+  const pct = Math.max(0, Math.min(100, Math.round((vr.score ?? 0)*100)));
   v.textContent = vr.isMatch ? '✓ Match' : '✕ No match';
-  v.className = 'verdict ' + (vr.isMatch ? 'match' : 'nomatch');
-  $('barFill').style.width = pct + '%';
-  $('scoreText').textContent = 'Similarity ' + pct + '%  (threshold ' + Math.round((vr.threshold ?? 0) * 100) + '%)';
+  v.className = 'verdict '+(vr.isMatch?'match':'nomatch');
+  $('barFill').style.width = pct+'%';
+  $('scoreText').textContent = 'Similarity '+pct+'%  (threshold '+Math.round((vr.threshold ?? 0)*100)+'%)';
 }
-
-setRefMode('url');
-setMatchMode('face');
-setSelfieMode('local');
 </script>
 </body>
 </html>"""
+
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, fmt, *args):  # quieter logs
+        print("  " + (fmt % args))
+
+    def do_GET(self):
+        if self.path in ("/", "/ui", "/index.html"):
+            body = PAGE.replace("__BACKEND__", BACKEND).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        else:
+            self.send_error(404)
+
+    def do_POST(self):
+        if not self.path.startswith("/v1/faces/"):
+            self.send_error(404)
+            return
+        length = int(self.headers.get("Content-Length", "0"))
+        body = self.rfile.read(length)
+        # Forward the multipart body verbatim to the remote backend (same path).
+        req = urllib.request.Request(
+            f"{BACKEND}{self.path}",
+            data=body,
+            method="POST",
+            headers={"Content-Type": self.headers.get("Content-Type", "")},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                data = resp.read()
+                status = resp.status
+                ctype = resp.headers.get("Content-Type", "application/json")
+        except urllib.error.HTTPError as e:
+            data = e.read()
+            status = e.code
+            ctype = e.headers.get("Content-Type", "application/json")
+        except Exception as e:  # connection error to backend
+            data = f'{{"detail":"proxy_error: {e}"}}'.encode("utf-8")
+            status = 502
+            ctype = "application/json"
+        self.send_response(status)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+
+if __name__ == "__main__":
+    print(f"ZepIris local verify UI  ->  proxying to {BACKEND}")
+    print(f"Open:  http://localhost:{PORT}/")
+    ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()

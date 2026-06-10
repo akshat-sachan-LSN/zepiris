@@ -43,7 +43,7 @@ If you're running attendance or identity workflows at scale and don't want to st
 ZepIris simplifies face verification workflows by providing:
 
 - **Stateless 1:1 verification** — compare a live photo against a reference image; nothing is stored
-- **Pre-integrated face embeddings** using InsightFace's buffalo_l model (512-dimensional vectors)
+- **Pre-integrated face embeddings** using InsightFace (`antelopev2` by default, or `buffalo_l`; 512-dimensional vectors)
 - **COSINE similarity matching** with a configurable decision threshold
 - **Automated content safety checks**: nudity detection, anti-spoofing/liveness, blur detection — all via a dedicated ML inference service
 - **Reference image by S3 URL** — supply a presigned/public URL; fetched over plain HTTP, no AWS credentials required
@@ -65,7 +65,7 @@ ZepIris simplifies face verification workflows by providing:
 | Capability                    | Description                                                                              |
 | ----------------------------- | ---------------------------------------------------------------------------------------- |
 | **Stateless 1:1 Verify**      | Compare a live photo against a reference image; no enrollment, no storage                |
-| **Face Embedding**            | Extract 512-dimensional L2-normalized embeddings using InsightFace buffalo_l             |
+| **Face Embedding**            | 512-d L2-normalized embeddings via InsightFace (`antelopev2` default / `buffalo_l`)      |
 | **COSINE Matching**           | Configurable per-request decision threshold (`ZEPIRIS_VERIFY_THRESHOLD`)                 |
 | **Content Safety (ML)**       | Nudity, spoof/liveness, and blur detection via dedicated ML inference microservice       |
 | **Reference by S3 URL**       | Reference image fetched over plain HTTP from a presigned/public URL (no AWS creds)       |
@@ -128,7 +128,7 @@ ZepIris consists of **two independent FastAPI microservices** that communicate v
 
 - Run independent, parallelizable ML workloads
 - Maintain 4 PyTorch models in memory:
-  - **Face Embedding** — InsightFace buffalo_l (640×640 input → 512-d output)
+  - **Face Embedding** — InsightFace antelopev2/buffalo_l (640×640 detect → 512-d output)
   - **Nudity Detection** — MobileNetV2 (2-class classifier)
   - **Spoof Detection** — MobileNetV3-Large (liveness detection)
   - **Blur Detection** — ResNet18 (image quality assessment)
@@ -145,48 +145,130 @@ ZepIris consists of **two independent FastAPI microservices** that communicate v
 
 ## Quick Start
 
+ZepIris runs as **two services**: the main API (port 8000) and an ML inference
+microservice (port 8001). You can run them with **Docker Compose** (recommended)
+or **locally with Poetry**.
+
 ### Prerequisites
 
-- **Python 3.10–3.14** (tested on 3.10–3.14)
-- **Poetry 2.x** for dependency management ([install here](https://python-poetry.org/docs/#installation))
-- **Docker & Docker Compose** (v1.29+; recommended for all-in-one setup)
-- **2GB+ RAM**, **5GB+ free disk space** (for the ML models)
+| Requirement   | Notes                                                                       |
+| ------------- | --------------------------------------------------------------------------- |
+| **Hardware**  | 2 vCPU / **8 GB RAM** minimum, **30 GB+ disk** (PyTorch image + models)     |
+| **Docker**    | Docker Engine 24+ and the Compose v2 plugin (`docker compose`)              |
+| **Python**    | 3.10–3.14 (only for the local/Poetry path)                                  |
+| **Poetry**    | 2.x (only for the local/Poetry path) — [install](https://python-poetry.org/docs/#installation) |
+| **Internet**  | Outbound required: the ML service downloads InsightFace `antelopev2` (~360 MB) on first run; the API fetches S3 reference URLs at request time |
 
-Check your versions:
+> The recognition model (`antelopev2`, ResNet100) and all ML deps (PyTorch, OpenCV,
+> InsightFace, ONNX Runtime) are installed **inside the Docker images** — you do not
+> install them by hand for the Docker path.
+
+---
+
+### Option A — Run locally with Docker Compose (recommended)
 
 ```bash
-python3 --version
-poetry --version
-```
-
-### Docker Compose (One Command)
-
-For a fully containerized local setup:
-
-```bash
-# Clone and navigate
+# 1. Clone
 git clone <repository-url>
 cd zepiris
 
-# Start both services (api, ml-inference)
-docker-compose up -d
+# 2. Build + start both services (first build pulls PyTorch — a few minutes)
+docker compose up -d --build
 
-# Verify health
-curl http://localhost:8000/healthz
+# 3. Wait for health (ml-inference downloads antelopev2 on first boot)
+docker compose logs -f ml-inference     # Ctrl+C when "Application startup complete"
+curl http://localhost:8000/healthz       # {"status":"ok"}
 
-# Open API documentation
-# Visit: http://localhost:8000/docs
+# 4. Open the UI / docs
+#    UI:    http://localhost:8000/ui
+#    Docs:  http://localhost:8000/docs
 
-# Stop services
-docker-compose down
+# Stop
+docker compose down
 ```
 
-The Compose file sets `name: zepiris`, so images are tagged `zepiris-api` and `zepiris-ml-inference` regardless of clone directory name.
+Images are tagged `zepiris-api` and `zepiris-ml-inference` (the Compose file sets
+`name: zepiris`).
 
-This starts **2 containers**:
+---
 
-- Main API (port 8000)
-- ML inference (port 8001)
+### Option B — Run locally with Poetry (no Docker)
+
+Installs Python deps into a local venv and runs both services. Useful for development.
+
+```bash
+# 1. System libraries OpenCV/InsightFace need (macOS: skip — wheels are self-contained)
+#    Debian/Ubuntu:
+sudo apt-get update && sudo apt-get install -y libgl1 libglib2.0-0 g++ curl
+
+# 2. Install Python dependencies (incl. ML extras: torch, insightface, onnxruntime)
+poetry install --extras ml
+
+# 3. Run BOTH services with one script (starts ml-inference, waits, starts api)
+chmod +x run_local.sh
+./run_local.sh
+#    UI:  http://localhost:8000/ui   ·   stop with Ctrl+C (kills both)
+```
+
+`run_local.sh` points the model paths at the local `./models/` directory and wires
+the API to the local ML service automatically. To run the services by hand instead:
+
+```bash
+# terminal 1 — ML inference
+make run-ml
+# terminal 2 — main API (points at the local ML service)
+make run-api-local
+```
+
+---
+
+### Option C — Deploy on EC2 (Docker Compose)
+
+```bash
+# --- Launch an instance ---
+# Ubuntu 22.04 LTS · t3.large (8 GB RAM) min · 30–40 GB gp3 root disk · public IP
+# Security Group inbound: 22 (your IP), 8000 (API/UI). Leave 8001 closed (internal).
+
+# --- 1. Install Docker + Compose plugin ---
+sudo apt-get update && sudo apt-get install -y ca-certificates curl git
+sudo install -m 0755 -d /etc/apt/keyrings
+sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+sudo chmod a+r /etc/apt/keyrings/docker.asc
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] \
+  https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo $VERSION_CODENAME) stable" \
+  | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+sudo apt-get update
+sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+sudo usermod -aG docker $USER && newgrp docker
+
+# --- 2. Clone + build (build serially to stay light on disk) ---
+git clone <repository-url> zepiris && cd zepiris
+ls models/                              # must contain *.pth AND *.onnx
+docker compose build ml-inference
+docker compose build api
+docker compose up -d
+
+# --- 3. Verify ---
+docker compose ps                       # both "healthy"
+docker compose logs -f ml-inference     # antelopev2 downloads once (~360 MB)
+curl http://localhost:8000/healthz      # {"status":"ok"}
+# From your laptop: curl http://<EC2_PUBLIC_IP>:8000/healthz
+```
+
+`restart: always` is set, so both containers survive reboots. To update later:
+`git pull && docker compose up -d --build`.
+
+**EC2 gotchas** (full guide in [docs/EC2_DEPLOY.md](docs/EC2_DEPLOY.md)):
+
+- **Disk too small** — the default 8 GB root volume can't fit PyTorch. Use **30–40 GB**;
+  if you hit `No space left on device`, resize the EBS volume then
+  `sudo growpart /dev/nvme0n1 1 && sudo resize2fs /dev/nvme0n1p1`.
+- **`/ui` camera** needs HTTPS — over plain `http://<ip>` use file upload (the default),
+  or put Caddy/HTTPS in front. Server-to-server API calls don't need HTTPS.
+- **InsightFace permission error** — the `insightface_cache` volume is created
+  root-owned on older deploys; if the ML log shows `Permission denied: .../.insightface`,
+  run `docker compose exec -u root ml-inference chown -R appuser:appuser /home/appuser/.insightface`
+  then `docker compose restart ml-inference`.
 
 ---
 
@@ -211,17 +293,35 @@ curl http://localhost:8000/readyz
 # {"status": "ok"}
 ```
 
-#### Verify a Face (1:1)
-
-Compare a live photo against a reference image supplied as an S3 URL. Nothing is persisted.
+#### Face Match (1:1) — selfie vs a reference photo
 
 ```bash
-curl -X POST http://localhost:8000/v1/faces/verify \
-  -F "file=@live.jpg" \
+# Reference as an S3 URL
+curl -X POST http://localhost:8000/v1/faces/facematch/verify \
+  -F "file=@selfie.jpg" \
   -F "s3_url=https://your-bucket.s3.amazonaws.com/ref.jpg?X-Amz-Signature=..."
+
+# OR reference as an uploaded photo
+curl -X POST http://localhost:8000/v1/faces/facematch/verify \
+  -F "file=@selfie.jpg" \
+  -F "reference_file=@reference.jpg"
 ```
 
-**Response:**
+#### Doc Match (1:1) — selfie vs the photo on an Aadhaar/PAN
+
+```bash
+# Document as an upload
+curl -X POST http://localhost:8000/v1/faces/docmatch/verify \
+  -F "file=@selfie.jpg" \
+  -F "document_file=@aadhaar.jpg"
+
+# OR document as an S3 URL
+curl -X POST http://localhost:8000/v1/faces/docmatch/verify \
+  -F "file=@selfie.jpg" \
+  -F "s3_url=https://your-bucket.s3.amazonaws.com/aadhaar.jpg"
+```
+
+**Response (both endpoints):**
 
 ```json
 {
@@ -244,11 +344,26 @@ curl -X POST http://localhost:8000/v1/faces/verify \
 
 **Parameters:**
 
-- `file` (required, form) — live photo upload (JPEG/PNG, max 5 MB)
-- `s3_url` (required, form) — presigned/public URL of the reference image
-- `threshold` (optional, form) — cosine match threshold; defaults to `ZEPIRIS_VERIFY_THRESHOLD` (0.5)
-- Returns `200 OK` with flags (and `score: null`) on early exit — live-photo decode failure, liveness failure, IQA not passed, or no face in the live photo
-- Returns `400 Bad Request` for reference-image problems: `reference_image_fetch_failed`, `reference_image_decode_failed`, `reference_face_not_detected`
+| Field            | facematch        | docmatch          | Notes                                                  |
+| ---------------- | ---------------- | ----------------- | ------------------------------------------------------ |
+| `file`           | required         | required          | Live selfie (JPEG/PNG, max 5 MB) — liveness/IQA run here |
+| `s3_url`         | reference option | document option   | Presigned/public URL, fetched server-side              |
+| `reference_file` | reference option | —                 | Uploaded reference photo                               |
+| `document_file`  | —                | document option   | Uploaded Aadhaar/PAN scan                              |
+| `threshold`      | optional         | optional          | Cosine cutoff. Defaults: face `0.5`, doc `0.4`         |
+
+- Supply **exactly one** reference source. Liveness/quality gates run only on the
+  selfie; the reference/document is only embedded (so a stored photo or ID scan is fine).
+- `200 OK` with flags (and `score: null`) on early exit — decode failure, liveness
+  failure, IQA not passed, or no face in the selfie.
+- `400 Bad Request` for reference problems: `reference_image_fetch_failed`,
+  `reference_image_decode_failed`, `reference_face_not_detected`.
+- `POST /v1/faces/verify` remains as a deprecated alias of `facematch/verify`.
+
+> **Accuracy & speed:** the recognition model defaults to `antelopev2` (ResNet100,
+> higher accuracy). Set `ML_SERVICE_FACE_MODEL_NAME=buffalo_l` for faster CPU
+> inference at slightly lower accuracy. Document photos embed weaker than selfies,
+> which is why docmatch uses a more lenient default threshold.
 
 See [docs/API_REFERENCE.md](docs/API_REFERENCE.md) for every early-exit and error variant.
 
@@ -417,7 +532,8 @@ Copy `.env.example` to `.env` and customize. All settings use environment variab
 | `ZEPIRIS_API_VERSION` | `1.0.0` | API version (OpenAPI `info.version`) |
 | `ZEPIRIS_API_HOST` | `0.0.0.0` | Bind host |
 | `ZEPIRIS_API_PORT` | `8000` | Bind port |
-| `ZEPIRIS_VERIFY_THRESHOLD` | `0.5` | Default COSINE similarity match threshold for verify |
+| `ZEPIRIS_VERIFY_THRESHOLD` | `0.5` | Default COSINE match threshold for **facematch** |
+| `ZEPIRIS_DOC_VERIFY_THRESHOLD` | `0.4` | Default COSINE match threshold for **docmatch** (more lenient) |
 | `ZEPIRIS_REFERENCE_FETCH_TIMEOUT_SECONDS` | `10.0` | HTTP timeout (s) when fetching the reference image from `s3_url` |
 | `ZEPIRIS_REFERENCE_MAX_BYTES` | `5242880` | Max size (bytes, 5 MB) of the fetched reference image |
 | `ZEPIRIS_ML_INFERENCE_SERVICE_URL` | *(required)* | URL of the ML inference service (e.g. `http://localhost:8001`) |
@@ -432,6 +548,8 @@ Copy `.env.example` to `.env` and customize. All settings use environment variab
 | `ML_SERVICE_HOST`                    | `0.0.0.0`                      | Bind host                                    |
 | `ML_SERVICE_PORT`                    | `8001`                         | Bind port                                    |
 | `ML_SERVICE_ML_DEVICE`               | `cpu`                          | Inference device: `cpu`, `cuda:0`, `mps`     |
+| `ML_SERVICE_FACE_MODEL_NAME`         | `antelopev2`                   | Recognition model: `antelopev2` (accurate) or `buffalo_l` (faster) |
+| `ML_SERVICE_FACE_DET_THRESH`         | `0.4`                          | Detector confidence; lower detects small/printed faces (Aadhaar/PAN) |
 | `ML_SERVICE_NUDITY_LOCAL_MODEL_PATH` | `/app/models/nudity_model.pth` | Nudity model file                            |
 | `ML_SERVICE_NUDITY_HF_REPO_ID`       | ``                             | HuggingFace repo for nudity model (optional) |
 | `ML_SERVICE_NUDITY_THRESHOLD`        | `0.5`                          | Nudity classification threshold (0–1)        |

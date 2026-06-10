@@ -46,8 +46,15 @@ def _service_with_fake(monkeypatch, image, **kwargs) -> tuple[FaceEmbeddingServi
 
 
 def test_padding_retry_recovers_frame_filling_face(monkeypatch, image) -> None:
+    # Isolate the padding path: disable the low-threshold and upscale retries so
+    # the detector is tried exactly twice (original, then padded).
     service, det = _service_with_fake(
-        monkeypatch, image, enable_padding_retry=True, padding_fraction=0.25
+        monkeypatch,
+        image,
+        enable_padding_retry=True,
+        padding_fraction=0.25,
+        low_det_thresh=0.5,
+        enable_upscale_retry=False,
     )
 
     result = service.preprocess(image)
@@ -61,7 +68,13 @@ def test_padding_retry_recovers_frame_filling_face(monkeypatch, image) -> None:
 
 
 def test_padding_retry_disabled_returns_no_face(monkeypatch, image) -> None:
-    service, det = _service_with_fake(monkeypatch, image, enable_padding_retry=False)
+    service, det = _service_with_fake(
+        monkeypatch,
+        image,
+        enable_padding_retry=False,
+        low_det_thresh=0.5,
+        enable_upscale_retry=False,
+    )
 
     result = service.preprocess(image)
 
@@ -91,3 +104,54 @@ def test_first_pass_hit_skips_padding(monkeypatch, image) -> None:
     assert result["face"] is not None
     assert result["image"].shape[:2] == image.shape[:2]
     assert det.calls == 1
+
+
+class _MultiFaceDet:
+    """Detector returning a small central face and a large off-center face."""
+
+    def detect(self, image, max_num=0, metric="default"):
+        h, w = image.shape[:2]
+        small_central = [w * 0.45, h * 0.45, w * 0.55, h * 0.55, 0.97]   # tiny, centered
+        large_corner = [w * 0.05, h * 0.05, w * 0.55, h * 0.75, 0.95]    # big, off-center
+        bbox = np.array([small_central, large_corner], dtype=np.float32)
+        kps = np.zeros((2, 5, 2), dtype=np.float32)
+        kps[1] = w * 0.3  # distinct kps for the large face
+        return bbox, kps
+
+
+def test_selects_largest_face_not_central(monkeypatch) -> None:
+    img = np.zeros((200, 200, 3), dtype=np.uint8)
+    service = FaceEmbeddingService()
+    monkeypatch.setattr(service, "load_model", lambda: _FakeApp(_MultiFaceDet()))
+    face = service._select_face(img)
+    assert face is not None
+    # The large off-center face spans most of the frame; its width >> the tiny one.
+    assert (face.bbox[2] - face.bbox[0]) > 0.3 * 200
+
+
+class _ThreshAwareDet:
+    """Detector that only finds a face when det_thresh is lowered (mimics a faint
+    document photo) — verifies the low-threshold fallback in preprocess()."""
+
+    def __init__(self) -> None:
+        self.det_thresh = 0.5
+        self.calls: list[float] = []
+
+    def detect(self, image, max_num=0, metric="default"):
+        self.calls.append(self.det_thresh)
+        if self.det_thresh <= 0.35:  # only the low-confidence retry succeeds
+            h, w = image.shape[:2]
+            bbox = np.array([[w * 0.2, h * 0.2, w * 0.6, h * 0.6, 0.4]], dtype=np.float32)
+            kps = np.full((1, 5, 2), w * 0.3, dtype=np.float32)
+            return bbox, kps
+        return np.empty((0, 5), dtype=np.float32), np.empty((0, 5, 2), dtype=np.float32)
+
+
+def test_low_threshold_fallback_recovers_faint_face(monkeypatch) -> None:
+    img = np.zeros((300, 300, 3), dtype=np.uint8)
+    service = FaceEmbeddingService(enable_padding_retry=False, enable_upscale_retry=False)
+    det = _ThreshAwareDet()
+    monkeypatch.setattr(service, "load_model", lambda: _FakeApp(det))
+    out = service.preprocess(img)
+    assert out["face"] is not None              # recovered via the low-thresh retry
+    assert any(t <= 0.35 for t in det.calls)    # the fallback threshold was used
