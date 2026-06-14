@@ -103,6 +103,11 @@ class MLServiceSettings(BaseSettings):
     # Retry detection on an upscaled copy when no face is found (helps tiny doc faces).
     face_enable_upscale_retry: bool = True
     face_upscale_factor: float = 2.0
+    # Average each face embedding with its horizontal-mirror embedding (flip TTA).
+    # Standard ArcFace trick; measurably improves robustness on low-quality/blurry
+    # inputs (printed document photos) with no impostor-score cost. One extra
+    # recognition pass per embed.
+    face_enable_flip_tta: bool = True
 
 
 @lru_cache
@@ -151,6 +156,7 @@ async def lifespan(app: FastAPI):
             low_det_thresh=s.face_low_det_thresh,
             enable_upscale_retry=s.face_enable_upscale_retry,
             upscale_factor=s.face_upscale_factor,
+            enable_flip_tta=s.face_enable_flip_tta,
         )
         app.state.face_embedding_service.load_model()
     except Exception:

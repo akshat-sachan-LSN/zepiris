@@ -10,6 +10,7 @@ import cv2
 import numpy as np
 from insightface.app import FaceAnalysis
 from insightface.app.common import Face
+from insightface.utils import face_align
 
 from zepiris.ml_inference.base import ModelService, ModelServiceConfig
 from zepiris.schemas.ml_inference import FaceDetectionResult, FaceEmbeddingResult
@@ -40,6 +41,7 @@ class FaceEmbeddingService(ModelService):
         enable_upscale_retry: bool = True,
         upscale_factor: float = 2.0,
         upscale_max_side: int = 2000,
+        enable_flip_tta: bool = True,
     ) -> None:
         """Initialize face embedding service.
 
@@ -66,6 +68,11 @@ class FaceEmbeddingService(ModelService):
                 copy of the image. Small document faces detect far better when enlarged.
             upscale_factor: How much to enlarge on the upscale retry.
             upscale_max_side: Cap the longer side after upscaling (avoid huge images).
+            enable_flip_tta: If True, average the embedding of the aligned face with
+                that of its horizontal mirror (test-time augmentation). A standard
+                ArcFace trick that measurably improves robustness on low-quality /
+                blurry inputs (e.g. printed document photos) at the cost of one extra
+                recognition pass; impostor scores are unaffected.
         """
         self._embedding_dim = embedding_dim
         self._detection_size = detection_size
@@ -78,6 +85,7 @@ class FaceEmbeddingService(ModelService):
         self._enable_upscale_retry = enable_upscale_retry
         self._upscale_factor = upscale_factor
         self._upscale_max_side = upscale_max_side
+        self._enable_flip_tta = enable_flip_tta
         self._face_app: FaceAnalysis | None = None
         config = ModelServiceConfig(
             model_name="face_embedding",
@@ -294,7 +302,19 @@ class FaceEmbeddingService(ModelService):
             return np.zeros(self._embedding_dim, dtype=np.float32), False
 
         app = self.load_model()
-        embedding = app.models["recognition"].get(preprocessed_data["image"], face)
+        rec = app.models["recognition"]
+
+        if not self._enable_flip_tta:
+            embedding = rec.get(preprocessed_data["image"], face)
+            return np.asarray(embedding, dtype=np.float32), True
+
+        # Flip test-time augmentation: align the face once (keypoint-driven warp),
+        # then average the embedding of the aligned crop and its horizontal mirror.
+        # Summing here is fine — postprocess() L2-normalizes the result.
+        aligned = face_align.norm_crop(
+            preprocessed_data["image"], landmark=face.kps, image_size=rec.input_size[0]
+        )
+        embedding = rec.get_feat(aligned).flatten() + rec.get_feat(cv2.flip(aligned, 1)).flatten()
 
         return np.asarray(embedding, dtype=np.float32), True
 
