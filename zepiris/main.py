@@ -10,6 +10,7 @@ from zepiris.config import get_settings
 from zepiris.exception_handlers import register_exception_handlers
 from zepiris.services.embedding import MLInferenceEmbeddingService
 from zepiris.services.iqa import MLInferenceIQAService
+from zepiris.services.learning import AdaptiveThresholdLearner
 from zepiris.services.ml_client import MLInferenceClient
 from zepiris.services.s3_fetcher import S3ImageFetcher
 
@@ -19,7 +20,7 @@ async def lifespan(app: FastAPI):
     settings = get_settings()
 
     base = settings.ml_inference_service_url.rstrip("/")
-    ml_client = MLInferenceClient(base)
+    ml_client = MLInferenceClient(base, timeout_seconds=settings.ml_inference_timeout_seconds)
 
     fetch_client = httpx.Client(timeout=settings.reference_fetch_timeout_seconds)
     s3_fetcher = S3ImageFetcher(client=fetch_client, max_bytes=settings.reference_max_bytes)
@@ -27,6 +28,13 @@ async def lifespan(app: FastAPI):
     app.state.iqa = MLInferenceIQAService(ml_client)
     app.state.embedding = MLInferenceEmbeddingService(ml_client)
     app.state.s3_fetcher = s3_fetcher
+    app.state.learner = AdaptiveThresholdLearner(
+        settings.learning_dir,
+        min_genuine=settings.learning_min_genuine,
+        min_impostor=settings.learning_min_impostor,
+        far_target=settings.learning_far_target,
+        enabled=settings.learning_enabled,
+    )
 
     yield
 

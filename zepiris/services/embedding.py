@@ -52,17 +52,17 @@ class FaceEmbeddingProvider(ABC):
     """
 
     @abstractmethod
-    def embed(self, image_bgr: np.ndarray) -> FaceEmbeddingResult:
+    def embed(self, image_rgb: np.ndarray) -> FaceEmbeddingResult:
         raise NotImplementedError
 
-    def detect_box(self, image_bgr: np.ndarray) -> FaceDetectionResult:
+    def detect_box(self, image_rgb: np.ndarray) -> FaceDetectionResult:
         """Detect the primary face and return its normalized bounding box.
 
         Default implementation derives the box from :meth:`embed` (no box info,
         so it reports a full-frame box when a face is found). Real providers
         override this with a cheaper detection-only call.
         """
-        result = self.embed(image_bgr)
+        result = self.embed(image_rgb)
         return FaceDetectionResult(
             face_detected=result.face_detected,
             bbox=[0.0, 0.0, 1.0, 1.0] if result.face_detected else [0.0, 0.0, 0.0, 0.0],
@@ -80,8 +80,8 @@ class StubFaceEmbeddingService(FaceEmbeddingProvider):
     def __init__(self, dim: int) -> None:
         self._dim = dim
 
-    def embed(self, image_bgr: np.ndarray) -> FaceEmbeddingResult:
-        payload = image_bgr.tobytes()
+    def embed(self, image_rgb: np.ndarray) -> FaceEmbeddingResult:
+        payload = image_rgb.tobytes()
         seed = int.from_bytes(hashlib.sha256(payload).digest()[:8], "big")
         rng = np.random.default_rng(seed)
         vec = rng.standard_normal(self._dim, dtype=np.float64)
@@ -97,21 +97,32 @@ class StubFaceEmbeddingService(FaceEmbeddingProvider):
 
 
 class MLInferenceEmbeddingService(FaceEmbeddingProvider):
-    """Calls the ML inference microservice /v1/face/embed with a base64 JPEG derived from BGR."""
+    """Calls the ML inference microservice /v1/face/embed with a base64 PNG.
+
+    Callers pass RGB arrays. The ML service decodes with OpenCV (BGR) and
+    converts BGR->RGB, so the payload must be encoded from BGR for the colors
+    to survive the round trip — encoding the RGB array directly would hand the
+    recognition model channel-swapped images and degrade match scores.
+
+    PNG (lossless) rather than JPEG: the input already survived one JPEG
+    compression at capture, and a second lossy generation measurably blurs the
+    high-frequency detail the recognition model keys on.
+    """
 
     def __init__(self, client: MLInferenceClient) -> None:
         self._client = client
 
-    def embed(self, image_bgr: np.ndarray) -> FaceEmbeddingResult:
-        ok, buf = cv2.imencode(".jpg", image_bgr)
+    @staticmethod
+    def _rgb_to_png_b64(image_rgb: np.ndarray) -> str:
+        ok, buf = cv2.imencode(".png", cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR))
         if not ok:
             raise ImageEncodeError()
-        image_b64 = base64.b64encode(buf.tobytes()).decode("utf-8")
+        return base64.b64encode(buf.tobytes()).decode("utf-8")
+
+    def embed(self, image_rgb: np.ndarray) -> FaceEmbeddingResult:
+        image_b64 = self._rgb_to_png_b64(image_rgb)
         return _wrap_ml_errors(lambda: self._client.embed_face(image_b64))
 
-    def detect_box(self, image_bgr: np.ndarray) -> FaceDetectionResult:
-        ok, buf = cv2.imencode(".jpg", image_bgr)
-        if not ok:
-            raise ImageEncodeError()
-        image_b64 = base64.b64encode(buf.tobytes()).decode("utf-8")
+    def detect_box(self, image_rgb: np.ndarray) -> FaceDetectionResult:
+        image_b64 = self._rgb_to_png_b64(image_rgb)
         return _wrap_ml_errors(lambda: self._client.detect_face(image_b64))

@@ -323,10 +323,15 @@ class FaceEmbeddingService(ModelService):
     def detect_box(self, image_rgb: np.ndarray) -> FaceDetectionResult:
         """Detect the primary face and return its normalized bounding box.
 
-        Detection only (no recognition), so it is cheap enough to poll. Runs on
-        the original frame (no padding retry) so the returned box maps directly
-        to the image shown to the user. Used by the UI readiness ring to decide
-        whether the face is positioned inside the on-screen circle.
+        Detection only (no recognition), so it is cheap enough to poll. Used by
+        the UI readiness ring and by document face extraction.
+
+        Falls back to a lower confidence threshold and then an upscaled copy
+        when the primary pass finds nothing — small printed document faces need
+        both. Uniform upscaling preserves normalized coordinates, so the
+        returned box always maps directly onto the original frame. The reflect
+        padding retry used by :meth:`preprocess` is deliberately NOT used here:
+        padding shifts coordinates and the box would no longer line up.
 
         Args:
             image_rgb: Input image in RGB format, shape (H, W, 3), dtype uint8
@@ -334,11 +339,19 @@ class FaceEmbeddingService(ModelService):
         Returns:
             FaceDetectionResult: detection flag, normalized [x1, y1, x2, y2], score
         """
+        detected = image_rgb
         face = self._select_face(image_rgb)
+        if face is None and self._low_det_thresh < self._det_thresh:
+            face = self._select_face(image_rgb, det_thresh=self._low_det_thresh)
+        if face is None and self._enable_upscale_retry:
+            upscaled = self._upscale_image(image_rgb)
+            if upscaled is not image_rgb:
+                face = self._select_face(upscaled, det_thresh=self._low_det_thresh)
+                detected = upscaled
         if face is None:
             return FaceDetectionResult(face_detected=False, bbox=[0.0, 0.0, 0.0, 0.0])
 
-        h, w = image_rgb.shape[:2]
+        h, w = detected.shape[:2]
         x1, y1, x2, y2 = (float(v) for v in face.bbox[:4])
         bbox = [
             max(0.0, min(1.0, x1 / w)),

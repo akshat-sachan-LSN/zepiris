@@ -1,4 +1,4 @@
-import io
+import base64
 
 import cv2
 import numpy as np
@@ -7,10 +7,11 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from zepiris.api.routes import face as face_routes
-from zepiris.deps import EmbeddingDep, IQADep, S3FetcherDep, SettingsDep
+from zepiris.deps import EmbeddingDep, IQADep, LearnerDep, S3FetcherDep, SettingsDep
 from zepiris.exception_handlers import register_exception_handlers
 from zepiris.schemas.ml_inference import (
     BlurDetectionResult,
+    FaceDetectionResult,
     FaceEmbeddingResult,
     ImageQualityAssessmentResult,
     NSFWDetectionResult,
@@ -25,9 +26,14 @@ def _jpeg_bytes() -> bytes:
     return buf.tobytes()
 
 
+def _jpeg_b64() -> str:
+    return base64.b64encode(_jpeg_bytes()).decode()
+
+
 class _Settings:
     verify_threshold = 0.5
     doc_verify_threshold = 0.4
+    doc_min_sharpness = 0.0
 
 
 class _IQA:
@@ -44,17 +50,24 @@ class _IQA:
 
 
 class _Embedding:
-    def __init__(self, *, live_vec, ref_vec, face=True) -> None:
-        self._vecs = [live_vec, ref_vec]
+    def __init__(self, *, live_vec, ref_vec, face=True, extra_vecs=None, doc_bbox=None) -> None:
+        self._vecs = [live_vec, ref_vec, *(extra_vecs or [])]
         self._face = face
+        # Full-frame box by default -> doc extraction is skipped (face-dominant image).
+        self._doc_bbox = doc_bbox if doc_bbox is not None else [0.0, 0.0, 1.0, 1.0]
+        self.embedded_shapes: list[tuple] = []
 
     def embed(self, image_rgb) -> FaceEmbeddingResult:
+        self.embedded_shapes.append(image_rgb.shape)
         vec = self._vecs.pop(0)
         return FaceEmbeddingResult(
             face_detected=self._face if vec is not None else False,
             embedding=vec or [],
             embedding_dim=len(vec or []),
         )
+
+    def detect_box(self, image_rgb) -> FaceDetectionResult:
+        return FaceDetectionResult(face_detected=True, bbox=self._doc_bbox, score=0.9)
 
 
 class _Fetcher:
@@ -65,7 +78,26 @@ class _Fetcher:
         return self._data
 
 
-def _client(iqa, embedding, fetcher) -> TestClient:
+class _Learner:
+    """Stub adaptive learner: records calls, serves canned learned thresholds."""
+
+    def __init__(self, learned: dict[str, float] | None = None) -> None:
+        self._learned = learned or {}
+        self.samples: list[dict] = []
+        self.feedback: list[dict] = []
+
+    def learned_threshold(self, doc_type: str) -> float | None:
+        return self._learned.get(doc_type)
+
+    def record_sample(self, **kwargs) -> None:
+        self.samples.append(kwargs)
+
+    def record_feedback(self, *, request_id: str, genuine: bool) -> dict:
+        self.feedback.append({"request_id": request_id, "genuine": genuine})
+        return {"recorded": True, "matched_sample": False, "doc_type": None, "thresholds": {}}
+
+
+def _client(iqa, embedding, fetcher, learner=None) -> TestClient:
     app = FastAPI()
     register_exception_handlers(app)
     app.include_router(face_routes.router, prefix="/v1/faces")
@@ -73,14 +105,19 @@ def _client(iqa, embedding, fetcher) -> TestClient:
     app.dependency_overrides[IQADep.__metadata__[0].dependency] = lambda: iqa
     app.dependency_overrides[EmbeddingDep.__metadata__[0].dependency] = lambda: embedding
     app.dependency_overrides[S3FetcherDep.__metadata__[0].dependency] = lambda: fetcher
+    app.dependency_overrides[LearnerDep.__metadata__[0].dependency] = lambda: learner or _Learner()
     return TestClient(app)
 
 
+def _probe_s3_field(path: str) -> str:
+    """The probe-side (incoming image) S3 param name differs per endpoint."""
+    return "doc_check_s3" if "docmatch" in path else "face_check_s3"
+
+
 def _post(client, *, s3_url="https://s3/ref.jpg", path="/v1/faces/facematch/verify"):
+    """Canonical request (JSON body): probe from the S3 URL, base64 source selfie."""
     return client.post(
-        path,
-        data={"s3_url": s3_url},
-        files={"file": ("live.jpg", io.BytesIO(_jpeg_bytes()), "image/jpeg")},
+        path, json={"source_selfie_b64": _jpeg_b64(), _probe_s3_field(path): s3_url}
     )
 
 
@@ -92,76 +129,381 @@ def test_match_when_vectors_identical() -> None:
     body = r.json()
     assert body["verificationResult"]["isMatch"] is True
     assert body["verificationResult"]["score"] == pytest.approx(1.0)
+    assert body["iqaPassed"] is True                       # base64 selfie = online
+    assert body["imageQualityAssessment"] is not None      # IQA always runs
 
 
-def test_facematch_reference_via_uploaded_file() -> None:
-    """facematch reference supplied as an uploaded photo instead of s3_url."""
+def test_docmatch_document_vs_source_selfie() -> None:
+    """docmatch: uploaded document (doc_check) vs enrolled selfie, lenient default.
+
+    docmatch runs NO liveness/IQA gate (the probe is a printed document, not a
+    live face), so imageQualityAssessment is absent.
+    """
     vec = [1.0, 0.0, 0.0]
-    client = _client(_IQA(), _Embedding(live_vec=vec, ref_vec=vec), _Fetcher(b"unused"))
+    client = _client(_IQA(), _Embedding(live_vec=vec, ref_vec=vec), _Fetcher(_jpeg_bytes()))
+    r = _post(client, path="/v1/faces/docmatch/verify", s3_url="https://s3/aadhaar.jpg")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["verificationResult"]["isMatch"] is True
+    assert body["iqaPassed"] is True
+    assert body["imageQualityAssessment"] is None  # no liveness gate on documents
+    assert body["verificationResult"]["threshold"] == pytest.approx(0.4)  # doc default
+
+
+def test_facematch_returns_score_block() -> None:
+    """The response exposes a flat scores block: match + liveness/blur/nsfw + margin."""
+    vec = [1.0, 0.0, 0.0]
+    client = _client(_IQA(), _Embedding(live_vec=vec, ref_vec=vec), _Fetcher(_jpeg_bytes()))
+    body = _post(client).json()
+    scores = body["scores"]
+    assert scores["matchScore"] == pytest.approx(1.0)
+    assert scores["threshold"] == pytest.approx(0.5)
+    assert scores["margin"] == pytest.approx(0.5)
+    assert scores["livenessScore"] == pytest.approx(0.99)  # _IQA spoof probability
+    assert scores["blurScore"] == pytest.approx(0.95)
+    assert scores["nsfwSafeScore"] == pytest.approx(0.01)
+    assert body["verificationResult"]["thresholdSource"] == "default"
+
+
+def test_docmatch_scores_have_no_liveness_numbers() -> None:
+    """docmatch runs no IQA, so quality scores are null but the match score is present."""
+    vec = [1.0, 0.0, 0.0]
+    client = _client(_IQA(), _Embedding(live_vec=vec, ref_vec=vec), _Fetcher(_jpeg_bytes()))
+    body = _post(client, path="/v1/faces/docmatch/verify", s3_url="https://s3/aadhaar.jpg").json()
+    scores = body["scores"]
+    assert scores["matchScore"] == pytest.approx(1.0)
+    assert scores["livenessScore"] is None
+    assert scores["blurScore"] is None
+    assert scores["nsfwSafeScore"] is None
+
+
+def test_threshold_source_reports_learned() -> None:
+    """When a learned threshold is applied, the response says so."""
+    vec = [1.0, 0.0, 0.0]
+    learner = _Learner(learned={"aadhaar": 0.55})
+    client = _client(_IQA(), _Embedding(live_vec=vec, ref_vec=vec), _Fetcher(_jpeg_bytes()), learner)
+    r = client.post(
+        "/v1/faces/docmatch/verify",
+        json={
+            "source_selfie_b64": _jpeg_b64(),
+            "doc_check_s3": "https://s3/aadhaar.jpg",
+            "doc_type": "aadhaar",
+        },
+    )
+    assert r.json()["verificationResult"]["thresholdSource"] == "learned"
+
+
+def test_recorded_sample_includes_quality_scores() -> None:
+    """facematch logs the liveness/quality scores alongside the match score for learning."""
+    vec = [1.0, 0.0, 0.0]
+    learner = _Learner()
+    client = _client(_IQA(), _Embedding(live_vec=vec, ref_vec=vec), _Fetcher(_jpeg_bytes()), learner)
+    _post(client)
+    assert len(learner.samples) == 1
+    sample = learner.samples[0]
+    assert sample["liveness_score"] == pytest.approx(0.99)
+    assert sample["blur_score"] == pytest.approx(0.95)
+    assert sample["nsfw_safe_score"] == pytest.approx(0.01)
+
+
+def test_docmatch_reports_document_face_diagnostics() -> None:
+    """docmatch surfaces a documentFace block (detection score, sharpness, crop used)."""
+    vec = [1.0, 0.0, 0.0]
+    embedding = _Embedding(live_vec=vec, ref_vec=vec, doc_bbox=[0.05, 0.2, 0.25, 0.7])
+    client = _client(_IQA(), embedding, _Fetcher(_doc_jpeg_bytes()))
+    body = _post(client, path="/v1/faces/docmatch/verify", s3_url="https://s3/aadhaar.jpg").json()
+    doc = body["documentFace"]
+    assert doc["faceDetected"] is True
+    assert doc["usedCrop"] is True
+    assert doc["detScore"] == pytest.approx(0.9)
+    assert "sharpness" in doc
+    assert doc["lowQuality"] is False  # min_sharpness disabled by default
+
+
+def test_facematch_has_no_document_face_block() -> None:
+    """facematch is not a document flow, so documentFace is null."""
+    vec = [1.0, 0.0, 0.0]
+    client = _client(_IQA(), _Embedding(live_vec=vec, ref_vec=vec), _Fetcher(_jpeg_bytes()))
+    assert _post(client).json()["documentFace"] is None
+
+
+def test_docmatch_rejects_too_blurry_document_when_gate_enabled() -> None:
+    """With doc_min_sharpness set, a sub-threshold extracted face is rejected (422)."""
+
+    class _StrictSettings(_Settings):
+        doc_min_sharpness = 1000.0  # higher than any real crop -> always too blurry
+
+    vec = [1.0, 0.0, 0.0]
+    embedding = _Embedding(live_vec=vec, ref_vec=vec, doc_bbox=[0.05, 0.2, 0.25, 0.7])
+    app = FastAPI()
+    register_exception_handlers(app)
+    app.include_router(face_routes.router, prefix="/v1/faces")
+    app.dependency_overrides[SettingsDep.__metadata__[0].dependency] = lambda: _StrictSettings()
+    app.dependency_overrides[IQADep.__metadata__[0].dependency] = lambda: _IQA()
+    app.dependency_overrides[EmbeddingDep.__metadata__[0].dependency] = lambda: embedding
+    app.dependency_overrides[S3FetcherDep.__metadata__[0].dependency] = lambda: _Fetcher(
+        _doc_jpeg_bytes()
+    )
+    app.dependency_overrides[LearnerDep.__metadata__[0].dependency] = lambda: _Learner()
+    client = TestClient(app)
+    r = client.post(
+        "/v1/faces/docmatch/verify",
+        json={"source_selfie_b64": _jpeg_b64(), "doc_check_s3": "https://s3/aadhaar.jpg"},
+    )
+    assert r.status_code == 422
+    assert r.json()["detail"]["message"] == "document_too_blurry"
+
+
+def test_docmatch_does_not_run_liveness() -> None:
+    """A spoof-flagged document still verifies: docmatch never runs the liveness gate."""
+    vec = [1.0, 0.0, 0.0]
+    # _IQA(live=False) would short-circuit facematch, but docmatch never calls it.
+    client = _client(
+        _IQA(live=False), _Embedding(live_vec=vec, ref_vec=vec), _Fetcher(_jpeg_bytes())
+    )
+    r = _post(client, path="/v1/faces/docmatch/verify", s3_url="https://s3/aadhaar.jpg")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["verificationResult"]["isMatch"] is True
+    assert "livenessFailed" not in body
+
+
+def _doc_jpeg_bytes(h: int = 400, w: int = 640) -> bytes:
+    """A document-sized image (landscape card scan) for doc-extraction tests."""
+    img = np.zeros((h, w, 3), dtype=np.uint8)
+    ok, buf = cv2.imencode(".jpg", img)
+    assert ok
+    return buf.tobytes()
+
+
+def test_docmatch_embeds_extracted_face_crop() -> None:
+    """docmatch splits the face photo out of the uploaded document and embeds the crop.
+
+    The detected box is small (an ID-card photo), so the probe (doc_check)
+    embedding must run on a cropped, upscaled face image — not on the full
+    document scan. The probe is embedded first, the source selfie second.
+    """
+    vec = [1.0, 0.0, 0.0]
+    embedding = _Embedding(
+        live_vec=vec, ref_vec=vec, doc_bbox=[0.05, 0.2, 0.25, 0.7]
+    )  # face occupies a small corner of the card
+    client = _client(_IQA(), embedding, _Fetcher(_doc_jpeg_bytes()))
+    r = _post(client, path="/v1/faces/docmatch/verify", s3_url="https://s3/aadhaar.jpg")
+    assert r.status_code == 200
+    assert r.json()["verificationResult"]["isMatch"] is True
+
+    probe_shape, _source_shape = embedding.embedded_shapes
+    assert probe_shape != (400, 640, 3)  # not the full document
+    assert min(probe_shape[:2]) >= face_routes.DOC_FACE_MIN_SIDE  # upscaled crop
+
+
+def test_docmatch_falls_back_to_full_document_when_crop_has_no_face() -> None:
+    """If embedding the extracted crop finds no face, the full document is embedded."""
+    vec = [1.0, 0.0, 0.0]
+    embedding = _Embedding(
+        live_vec=None,  # crop attempt (embedded first) -> no face detected
+        ref_vec=vec,  # full-document fallback succeeds
+        extra_vecs=[vec],  # source selfie
+        doc_bbox=[0.05, 0.2, 0.25, 0.7],
+    )
+    client = _client(_IQA(), embedding, _Fetcher(_doc_jpeg_bytes()))
+    r = _post(client, path="/v1/faces/docmatch/verify", s3_url="https://s3/aadhaar.jpg")
+    assert r.status_code == 200
+    assert r.json()["verificationResult"]["isMatch"] is True
+    assert (400, 640, 3) in embedding.embedded_shapes  # fell back to full doc
+
+
+def test_facematch_never_runs_doc_extraction() -> None:
+    """facematch embeds the incoming face as-is even when a small box is reported."""
+    vec = [1.0, 0.0, 0.0]
+    embedding = _Embedding(live_vec=vec, ref_vec=vec, doc_bbox=[0.05, 0.2, 0.25, 0.7])
+    client = _client(_IQA(), embedding, _Fetcher(_doc_jpeg_bytes()))
+    r = _post(client, s3_url="https://s3/ref.jpg")
+    assert r.status_code == 200
+    assert embedding.embedded_shapes[0] == (400, 640, 3)  # full probe image, no crop
+
+
+def test_docmatch_uses_learned_threshold_for_doc_type() -> None:
+    """With no explicit threshold, the learned per-doc-type threshold wins over the default."""
+    vec = [1.0, 0.0, 0.0]
+    learner = _Learner(learned={"aadhaar": 0.55})
+    client = _client(_IQA(), _Embedding(live_vec=vec, ref_vec=vec), _Fetcher(_jpeg_bytes()), learner)
+    r = client.post(
+        "/v1/faces/docmatch/verify",
+        json={
+            "source_selfie_b64": _jpeg_b64(),
+            "doc_check_s3": "https://s3/aadhaar.jpg",
+            "doc_type": "Aadhaar",
+        },
+    )
+    assert r.status_code == 200
+    assert r.json()["verificationResult"]["threshold"] == pytest.approx(0.55)
+
+
+def test_explicit_threshold_beats_learned() -> None:
+    vec = [1.0, 0.0, 0.0]
+    learner = _Learner(learned={"pan": 0.55})
+    client = _client(_IQA(), _Embedding(live_vec=vec, ref_vec=vec), _Fetcher(_jpeg_bytes()), learner)
+    r = client.post(
+        "/v1/faces/docmatch/verify",
+        json={
+            "source_selfie_b64": _jpeg_b64(),
+            "doc_check_s3": "https://s3/pan.jpg",
+            "doc_type": "pan",
+            "threshold": 0.6,
+        },
+    )
+    assert r.json()["verificationResult"]["threshold"] == pytest.approx(0.6)
+
+
+def test_scored_verification_is_recorded_for_learning() -> None:
+    vec = [1.0, 0.0, 0.0]
+    learner = _Learner()
+    client = _client(_IQA(), _Embedding(live_vec=vec, ref_vec=vec), _Fetcher(_jpeg_bytes()), learner)
+    r = client.post(
+        "/v1/faces/docmatch/verify",
+        json={
+            "source_selfie_b64": _jpeg_b64(),
+            "doc_check_s3": "https://s3/aadhaar.jpg",
+            "doc_type": "aadhaar",
+        },
+    )
+    assert r.status_code == 200
+    assert len(learner.samples) == 1
+    sample = learner.samples[0]
+    assert sample["doc_type"] == "aadhaar"
+    assert sample["request_id"] == r.json()["requestId"]
+    assert sample["score"] == pytest.approx(1.0)
+
+
+def test_unscored_verification_is_not_recorded() -> None:
+    """Liveness failures carry no match score, so nothing is logged for learning."""
+    learner = _Learner()
+    client = _client(
+        _IQA(live=False), _Embedding(live_vec=[1.0], ref_vec=[1.0]), _Fetcher(_jpeg_bytes()), learner
+    )
+    _post(client)
+    assert learner.samples == []
+
+
+def test_feedback_endpoint_records_outcome() -> None:
+    learner = _Learner()
+    client = _client(_IQA(), _Embedding(live_vec=[1.0], ref_vec=[1.0]), _Fetcher(_jpeg_bytes()), learner)
+    r = client.post("/v1/faces/feedback", data={"request_id": "abc-123", "genuine": "true"})
+    assert r.status_code == 200
+    assert r.json()["recorded"] is True
+    assert learner.feedback == [{"request_id": "abc-123", "genuine": True}]
+
+
+def test_feedback_endpoint_requires_fields() -> None:
+    client = _client(_IQA(), _Embedding(live_vec=[1.0], ref_vec=[1.0]), _Fetcher(_jpeg_bytes()))
+    r = client.post("/v1/faces/feedback", data={"request_id": "abc-123"})
+    assert r.status_code == 400
+
+
+def test_selfie_b64_accepts_data_uri() -> None:
+    """A data: URI payload is accepted for the selfie."""
+    vec = [1.0, 0.0, 0.0]
+    client = _client(_IQA(), _Embedding(live_vec=vec, ref_vec=vec), _Fetcher(_jpeg_bytes()))
     r = client.post(
         "/v1/faces/facematch/verify",
-        files={
-            "file": ("selfie.jpg", io.BytesIO(_jpeg_bytes()), "image/jpeg"),
-            "reference_file": ("photo.jpg", io.BytesIO(_jpeg_bytes()), "image/jpeg"),
+        json={
+            "source_selfie_b64": f"data:image/jpeg;base64,{_jpeg_b64()}",
+            "face_check_s3": "https://s3/ref.jpg",
         },
     )
     assert r.status_code == 200
     assert r.json()["verificationResult"]["isMatch"] is True
 
 
-def test_docmatch_via_uploaded_document() -> None:
-    """docmatch: selfie vs an uploaded Aadhaar/PAN document, lenient default threshold."""
+def test_invalid_base64_selfie_rejected() -> None:
+    client = _client(_IQA(), _Embedding(live_vec=[1.0], ref_vec=[1.0]), _Fetcher(_jpeg_bytes()))
+    r = client.post(
+        "/v1/faces/facematch/verify",
+        json={"source_selfie_b64": "!!!not-valid-base64!!!", "face_check_s3": "https://s3/ref.jpg"},
+    )
+    assert r.status_code == 400
+
+
+def test_facematch_probe_and_source_from_s3() -> None:
+    """Both sides can be S3 URLs; facematch still gates the probe (face_check) on liveness."""
     vec = [1.0, 0.0, 0.0]
-    client = _client(_IQA(), _Embedding(live_vec=vec, ref_vec=vec), _Fetcher(b"unused"))
+    client = _client(_IQA(), _Embedding(live_vec=vec, ref_vec=vec), _Fetcher(_jpeg_bytes()))
+    r = client.post(
+        "/v1/faces/facematch/verify",
+        json={"face_check_s3": "https://s3/live.jpg", "source_selfie_s3": "https://s3/db.jpg"},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["verificationResult"]["isMatch"] is True
+    assert body["iqaPassed"] is True
+    assert body["imageQualityAssessment"] is not None  # liveness ran on the probe
+
+
+def test_source_selfie_from_b64_matches() -> None:
+    """The enrolled source selfie can arrive as inline base64 instead of an S3 URL."""
+    vec = [1.0, 0.0, 0.0]
+    client = _client(_IQA(), _Embedding(live_vec=vec, ref_vec=vec), _Fetcher(_jpeg_bytes()))
+    r = client.post(
+        "/v1/faces/facematch/verify",
+        json={"source_selfie_b64": _jpeg_b64(), "face_check_b64": _jpeg_b64()},
+    )
+    assert r.status_code == 200
+    assert r.json()["verificationResult"]["isMatch"] is True
+
+
+def test_docmatch_reference_from_b64() -> None:
+    """docmatch also accepts the document as inline base64 (doc_check_b64)."""
+    vec = [1.0, 0.0, 0.0]
+    client = _client(_IQA(), _Embedding(live_vec=vec, ref_vec=vec), _Fetcher(_jpeg_bytes()))
     r = client.post(
         "/v1/faces/docmatch/verify",
-        files={
-            "file": ("selfie.jpg", io.BytesIO(_jpeg_bytes()), "image/jpeg"),
-            "document_file": ("aadhaar.jpg", io.BytesIO(_jpeg_bytes()), "image/jpeg"),
+        json={
+            "source_selfie_b64": _jpeg_b64(),
+            "doc_check_b64": _jpeg_b64(),
+            "doc_type": "aadhaar",
         },
     )
     assert r.status_code == 200
-    body = r.json()
-    assert body["verificationResult"]["isMatch"] is True
-    assert body["verificationResult"]["threshold"] == pytest.approx(0.4)  # doc default
+    assert r.json()["verificationResult"]["isMatch"] is True
 
 
-def test_facematch_s3_to_s3_skips_liveness() -> None:
-    """Selfie + reference both via S3 URL: pure image match, no liveness/IQA gate."""
-    vec = [1.0, 0.0, 0.0]
-    # _IQA would report a result, but it must NOT be consulted in the S3->S3 path.
-    client = _client(_IQA(live=False), _Embedding(live_vec=vec, ref_vec=vec), _Fetcher(_jpeg_bytes()))
-    r = client.post(
-        "/v1/faces/facematch/verify",
-        data={"selfie_s3_url": "https://s3/selfie.jpg", "s3_url": "https://s3/ref.jpg"},
-    )
-    assert r.status_code == 200
-    body = r.json()
-    assert body["verificationResult"]["isMatch"] is True          # matched despite live=False
-    assert body["iqaPassed"] is False                              # liveness skipped
-    assert body["imageQualityAssessment"] is None                 # no IQA run
-
-
-def test_docmatch_s3_to_s3_selfie_and_document() -> None:
-    """Selfie S3 link + document S3 link: extract doc face, compare, no liveness."""
-    vec = [1.0, 0.0, 0.0]
-    client = _client(_IQA(live=False), _Embedding(live_vec=vec, ref_vec=vec), _Fetcher(_jpeg_bytes()))
-    r = client.post(
-        "/v1/faces/docmatch/verify",
-        data={"selfie_s3_url": "https://s3/selfie.jpg", "s3_url": "https://s3/aadhaar.jpg"},
-    )
-    assert r.status_code == 200
-    body = r.json()
-    assert body["verificationResult"]["isMatch"] is True
-    assert body["verificationResult"]["threshold"] == pytest.approx(0.4)
-    assert body["imageQualityAssessment"] is None
+def test_error_when_no_selfie_provided() -> None:
+    client = _client(_IQA(), _Embedding(live_vec=[1.0], ref_vec=[1.0]), _Fetcher(_jpeg_bytes()))
+    r = client.post("/v1/faces/facematch/verify", json={"face_check_s3": "https://s3/ref.jpg"})
+    assert r.status_code == 400
 
 
 def test_error_when_no_reference_provided() -> None:
     client = _client(_IQA(), _Embedding(live_vec=[1.0], ref_vec=[1.0]), _Fetcher(_jpeg_bytes()))
+    r = client.post("/v1/faces/facematch/verify", json={"source_selfie_b64": _jpeg_b64()})
+    assert r.status_code == 400
+
+
+def test_error_when_both_selfie_sources_provided() -> None:
+    """Both base64 and S3 for the selfie is ambiguous -> rejected."""
+    client = _client(_IQA(), _Embedding(live_vec=[1.0], ref_vec=[1.0]), _Fetcher(_jpeg_bytes()))
     r = client.post(
         "/v1/faces/facematch/verify",
-        files={"file": ("live.jpg", io.BytesIO(_jpeg_bytes()), "image/jpeg")},
+        json={
+            "source_selfie_b64": _jpeg_b64(),
+            "source_selfie_s3": "https://s3/selfie.jpg",
+            "face_check_s3": "https://s3/ref.jpg",
+        },
+    )
+    assert r.status_code == 400
+
+
+def test_error_when_both_reference_sources_provided() -> None:
+    """Both base64 and S3 for the reference is ambiguous -> rejected."""
+    client = _client(_IQA(), _Embedding(live_vec=[1.0], ref_vec=[1.0]), _Fetcher(_jpeg_bytes()))
+    r = client.post(
+        "/v1/faces/facematch/verify",
+        json={
+            "source_selfie_b64": _jpeg_b64(),
+            "face_check_b64": _jpeg_b64(),
+            "face_check_s3": "https://s3/ref.jpg",
+        },
     )
     assert r.status_code == 400
 

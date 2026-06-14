@@ -43,7 +43,7 @@ If you're running attendance or identity workflows at scale and don't want to st
 ZepIris simplifies face verification workflows by providing:
 
 - **Stateless 1:1 verification** — compare a live photo against a reference image; nothing is stored
-- **Pre-integrated face embeddings** using InsightFace (`antelopev2` by default, or `buffalo_l`; 512-dimensional vectors)
+- **Pre-integrated face embeddings** using InsightFace `buffalo_l` (ResNet50, 512-dimensional vectors)
 - **COSINE similarity matching** with a configurable decision threshold
 - **Automated content safety checks**: nudity detection, anti-spoofing/liveness, blur detection — all via a dedicated ML inference service
 - **Reference image by S3 URL** — supply a presigned/public URL; fetched over plain HTTP, no AWS credentials required
@@ -65,7 +65,7 @@ ZepIris simplifies face verification workflows by providing:
 | Capability                    | Description                                                                              |
 | ----------------------------- | ---------------------------------------------------------------------------------------- |
 | **Stateless 1:1 Verify**      | Compare a live photo against a reference image; no enrollment, no storage                |
-| **Face Embedding**            | 512-d L2-normalized embeddings via InsightFace (`antelopev2` default / `buffalo_l`)      |
+| **Face Embedding**            | 512-d L2-normalized embeddings via InsightFace `buffalo_l` (ResNet50)                    |
 | **COSINE Matching**           | Configurable per-request decision threshold (`ZEPIRIS_VERIFY_THRESHOLD`)                 |
 | **Content Safety (ML)**       | Nudity, spoof/liveness, and blur detection via dedicated ML inference microservice       |
 | **Reference by S3 URL**       | Reference image fetched over plain HTTP from a presigned/public URL (no AWS creds)       |
@@ -128,7 +128,7 @@ ZepIris consists of **two independent FastAPI microservices** that communicate v
 
 - Run independent, parallelizable ML workloads
 - Maintain 4 PyTorch models in memory:
-  - **Face Embedding** — InsightFace antelopev2/buffalo_l (640×640 detect → 512-d output)
+  - **Face Embedding** — InsightFace buffalo_l (640×640 detect → 512-d output)
   - **Nudity Detection** — MobileNetV2 (2-class classifier)
   - **Spoof Detection** — MobileNetV3-Large (liveness detection)
   - **Blur Detection** — ResNet18 (image quality assessment)
@@ -157,9 +157,9 @@ or **locally with Poetry**.
 | **Docker**    | Docker Engine 24+ and the Compose v2 plugin (`docker compose`)              |
 | **Python**    | 3.10–3.14 (only for the local/Poetry path)                                  |
 | **Poetry**    | 2.x (only for the local/Poetry path) — [install](https://python-poetry.org/docs/#installation) |
-| **Internet**  | Outbound required: the ML service downloads InsightFace `antelopev2` (~360 MB) on first run; the API fetches S3 reference URLs at request time |
+| **Internet**  | Outbound required: the ML service downloads InsightFace `buffalo_l` (~330 MB) on first run; the API fetches S3 reference URLs at request time |
 
-> The recognition model (`antelopev2`, ResNet100) and all ML deps (PyTorch, OpenCV,
+> The recognition model (`buffalo_l`, ResNet50) and all ML deps (PyTorch, OpenCV,
 > InsightFace, ONNX Runtime) are installed **inside the Docker images** — you do not
 > install them by hand for the Docker path.
 
@@ -175,7 +175,7 @@ cd zepiris
 # 2. Build + start both services (first build pulls PyTorch — a few minutes)
 docker compose up -d --build
 
-# 3. Wait for health (ml-inference downloads antelopev2 on first boot)
+# 3. Wait for health (ml-inference downloads buffalo_l on first boot)
 docker compose logs -f ml-inference     # Ctrl+C when "Application startup complete"
 curl http://localhost:8000/healthz       # {"status":"ok"}
 
@@ -250,7 +250,7 @@ docker compose up -d
 
 # --- 3. Verify ---
 docker compose ps                       # both "healthy"
-docker compose logs -f ml-inference     # antelopev2 downloads once (~360 MB)
+docker compose logs -f ml-inference     # buffalo_l downloads once (~330 MB)
 curl http://localhost:8000/healthz      # {"status":"ok"}
 # From your laptop: curl http://<EC2_PUBLIC_IP>:8000/healthz
 ```
@@ -295,29 +295,21 @@ curl http://localhost:8000/readyz
 
 #### Face Match (1:1) — selfie vs a reference photo
 
-```bash
-# Reference as an S3 URL
-curl -X POST http://localhost:8000/v1/faces/facematch/verify \
-  -F "file=@selfie.jpg" \
-  -F "s3_url=https://your-bucket.s3.amazonaws.com/ref.jpg?X-Amz-Signature=..."
+The selfie is sent as **base64** (`selfie_b64`); the reference is an **S3 URL** (`s3_url`).
 
-# OR reference as an uploaded photo
+```bash
+# selfie_b64 = base64 of the live capture; s3_url = reference photo
 curl -X POST http://localhost:8000/v1/faces/facematch/verify \
-  -F "file=@selfie.jpg" \
-  -F "reference_file=@reference.jpg"
+  -F "selfie_b64=$(base64 -i selfie.jpg)" \
+  -F "s3_url=https://your-bucket.s3.amazonaws.com/ref.jpg?X-Amz-Signature=..."
 ```
 
 #### Doc Match (1:1) — selfie vs the photo on an Aadhaar/PAN
 
 ```bash
-# Document as an upload
+# selfie_b64 = base64 of the live capture; s3_url = ID document image
 curl -X POST http://localhost:8000/v1/faces/docmatch/verify \
-  -F "file=@selfie.jpg" \
-  -F "document_file=@aadhaar.jpg"
-
-# OR document as an S3 URL
-curl -X POST http://localhost:8000/v1/faces/docmatch/verify \
-  -F "file=@selfie.jpg" \
+  -F "selfie_b64=$(base64 -i selfie.jpg)" \
   -F "s3_url=https://your-bucket.s3.amazonaws.com/aadhaar.jpg"
 ```
 
@@ -344,20 +336,19 @@ curl -X POST http://localhost:8000/v1/faces/docmatch/verify \
 
 **Parameters:**
 
-| Field            | facematch        | docmatch          | Notes                                                  |
-| ---------------- | ---------------- | ----------------- | ------------------------------------------------------ |
-| `file`           | required         | required          | Live selfie (JPEG/PNG, max 5 MB) — liveness/IQA run here |
-| `s3_url`         | reference option | document option   | Presigned/public URL, fetched server-side              |
-| `reference_file` | reference option | —                 | Uploaded reference photo                               |
-| `document_file`  | —                | document option   | Uploaded Aadhaar/PAN scan                              |
-| `threshold`      | optional         | optional          | Cosine cutoff. Defaults: face `0.5`, doc `0.4`         |
+| Field        | facematch | docmatch | Notes                                                                       |
+| ------------ | --------- | -------- | --------------------------------------------------------------------------- |
+| `selfie_b64` | required  | required | Live selfie as base64 (bare or `data:` URI), max 5 MB — liveness/IQA run here |
+| `s3_url`     | required  | required | Reference/document image; presigned/public URL, fetched server-side         |
+| `threshold`  | optional  | optional | Cosine cutoff. Defaults: face `0.5`, doc `0.4`                               |
 
-- Supply **exactly one** reference source. Liveness/quality gates run only on the
-  selfie; the reference/document is only embedded (so a stored photo or ID scan is fine).
+- The selfie is always a live, online capture (base64), so liveness/quality gates
+  always run on it; the reference/document (S3 URL) is only embedded.
 - `200 OK` with flags (and `score: null`) on early exit — decode failure, liveness
   failure, IQA not passed, or no face in the selfie.
-- `400 Bad Request` for reference problems: `reference_image_fetch_failed`,
-  `reference_image_decode_failed`, `reference_face_not_detected`.
+- `400 Bad Request` for missing/invalid inputs and reference problems:
+  `invalid_base64`, `reference_image_fetch_failed`, `reference_image_decode_failed`,
+  `reference_face_not_detected`.
 - `POST /v1/faces/verify` remains as a deprecated alias of `facematch/verify`.
 
 > **Accuracy & speed:** the recognition model defaults to `antelopev2` (ResNet100,
@@ -548,7 +539,7 @@ Copy `.env.example` to `.env` and customize. All settings use environment variab
 | `ML_SERVICE_HOST`                    | `0.0.0.0`                      | Bind host                                    |
 | `ML_SERVICE_PORT`                    | `8001`                         | Bind port                                    |
 | `ML_SERVICE_ML_DEVICE`               | `cpu`                          | Inference device: `cpu`, `cuda:0`, `mps`     |
-| `ML_SERVICE_FACE_MODEL_NAME`         | `antelopev2`                   | Recognition model: `antelopev2` (accurate) or `buffalo_l` (faster) |
+| `ML_SERVICE_FACE_MODEL_NAME`         | `buffalo_l`                    | Recognition model. `buffalo_l` loads reliably; `antelopev2` is more accurate but fails to load with this image's InsightFace build |
 | `ML_SERVICE_FACE_DET_THRESH`         | `0.4`                          | Detector confidence; lower detects small/printed faces (Aadhaar/PAN) |
 | `ML_SERVICE_NUDITY_LOCAL_MODEL_PATH` | `/app/models/nudity_model.pth` | Nudity model file                            |
 | `ML_SERVICE_NUDITY_HF_REPO_ID`       | ``                             | HuggingFace repo for nudity model (optional) |

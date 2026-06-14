@@ -90,36 +90,21 @@ PAGE = """<!DOCTYPE html>
 
   <div class="grid">
     <div class="card">
-      <label>Selfie</label>
-      <div class="row" style="margin:0 0 12px">
-        <button class="secondary" id="selUpload" style="flex:1">Upload / camera</button>
-        <button class="secondary" id="selUrl" style="flex:1">S3 URL</button>
+      <label>Selfie (live capture, sent as base64)</label>
+      <div class="drop" id="drop">
+        <span id="dropText">Click to choose a photo<br/><small style="color:var(--muted)">(or drag &amp; drop)</small></span>
+        <input type="file" id="fileInput" accept="image/*"/>
       </div>
-      <div id="selLocalWrap">
-        <div class="drop" id="drop">
-          <span id="dropText">Click to choose a photo<br/><small style="color:var(--muted)">(or drag &amp; drop)</small></span>
-          <input type="file" id="fileInput" accept="image/*"/>
-        </div>
-        <button class="secondary" id="camBtn" style="margin-top:12px;width:100%">Use camera instead</button>
-        <div id="camWrap" style="display:none;margin-top:12px">
-          <video id="vid" autoplay playsinline muted style="width:100%;border-radius:12px;background:#000"></video>
-          <button id="snap" style="margin-top:10px;width:100%">Capture from camera</button>
-        </div>
+      <button class="secondary" id="camBtn" style="margin-top:12px;width:100%">Use camera instead</button>
+      <div id="camWrap" style="display:none;margin-top:12px">
+        <video id="vid" autoplay playsinline muted style="width:100%;border-radius:12px;background:#000"></video>
+        <button id="snap" style="margin-top:10px;width:100%">Capture from camera</button>
       </div>
-      <input type="text" id="selfieUrl" placeholder="https://bucket.s3.region.amazonaws.com/selfie.jpg" autocomplete="off" style="display:none"/>
       <img id="livePrev" class="thumb" alt="selfie preview"/>
     </div>
     <div class="card">
-      <label id="refLabel">Reference face (photo)</label>
-      <div class="row" style="margin:0 0 12px">
-        <button class="secondary" id="modeUrl" style="flex:1">S3 URL</button>
-        <button class="secondary" id="modeFile" style="flex:1">Upload doc</button>
-      </div>
+      <label id="refLabel">Reference face (S3 URL)</label>
       <input type="text" id="s3url" placeholder="https://bucket.s3.region.amazonaws.com/ref.jpg" autocomplete="off"/>
-      <div class="drop" id="refDrop" style="display:none">
-        <span id="refDropText">Click to choose a document/photo<br/><small style="color:var(--muted)">(Aadhaar / PAN / any face image)</small></span>
-        <input type="file" id="refFileInput" accept="image/*"/>
-      </div>
       <img id="refPrev" class="thumb" alt="reference preview"/>
     </div>
   </div>
@@ -145,40 +130,19 @@ PAGE = """<!DOCTYPE html>
 <script>
 const $ = (id) => document.getElementById(id);
 let liveBlob = null, liveURL = null, stream = null;
-let refMode = 'url', refBlob = null, refURL = null;
 let matchMode = 'face';  // 'face' -> facematch/verify, 'doc' -> docmatch/verify
 
 function setMatchMode(m){
   matchMode = m;
   $('modeFace').style.background = m === 'face' ? 'var(--accent)' : '#222c40';
   $('modeDoc').style.background = m === 'doc' ? 'var(--accent)' : '#222c40';
-  $('refLabel').textContent = m === 'doc' ? 'Reference document (Aadhaar/PAN)' : 'Reference face (photo)';
-  $('refDropText').innerHTML = m === 'doc'
-    ? 'Click to choose the ID document<br/><small style="color:var(--muted)">(Aadhaar / PAN scan)</small>'
-    : 'Click to choose a reference photo<br/><small style="color:var(--muted)">(any face image)</small>';
+  $('refLabel').textContent = m === 'doc' ? 'Reference document — Aadhaar/PAN (S3 URL)' : 'Reference face (S3 URL)';
+  $('s3url').placeholder = m === 'doc'
+    ? 'https://bucket.s3.region.amazonaws.com/aadhaar.jpg'
+    : 'https://bucket.s3.region.amazonaws.com/ref.jpg';
 }
 $('modeFace').addEventListener('click', () => setMatchMode('face'));
 $('modeDoc').addEventListener('click', () => setMatchMode('doc'));
-
-let selfieMode = 'local';  // 'local' (upload/camera) or 'url' (S3 link)
-function setSelfieMode(m){
-  selfieMode = m;
-  $('selLocalWrap').style.display = m === 'local' ? 'block' : 'none';
-  $('selfieUrl').style.display = m === 'url' ? 'block' : 'none';
-  $('selUpload').style.background = m === 'local' ? 'var(--accent)' : '#222c40';
-  $('selUrl').style.background = m === 'url' ? 'var(--accent)' : '#222c40';
-  $('livePrev').style.display = 'none';
-  if(m === 'url' && $('selfieUrl').value.trim()){ $('livePrev').src = $('selfieUrl').value.trim(); $('livePrev').style.display='block'; }
-  if(m === 'local' && liveURL){ $('livePrev').src = liveURL; $('livePrev').style.display='block'; }
-  refreshBtn();
-}
-$('selUpload').addEventListener('click', () => setSelfieMode('local'));
-$('selUrl').addEventListener('click', () => setSelfieMode('url'));
-$('selfieUrl').addEventListener('input', () => {
-  const u = $('selfieUrl').value.trim();
-  if(u){ $('livePrev').src = u; $('livePrev').style.display='block'; } else { $('livePrev').style.display='none'; }
-  refreshBtn();
-});
 
 function setLive(blob){
   liveBlob = blob;
@@ -188,36 +152,20 @@ function setLive(blob){
   $('dropText').innerHTML = 'Photo selected — click to change';
   refreshBtn();
 }
-function hasSelfie(){ return selfieMode === 'url' ? !!$('selfieUrl').value.trim() : !!liveBlob; }
-function hasRef(){ return refMode === 'url' ? !!$('s3url').value.trim() : !!refBlob; }
+function hasSelfie(){ return !!liveBlob; }
+function hasRef(){ return !!$('s3url').value.trim(); }
 function refreshBtn(){ $('verifyBtn').disabled = !(hasSelfie() && hasRef()); }
 
-function setRefMode(m){
-  refMode = m;
-  $('s3url').style.display = m === 'url' ? 'block' : 'none';
-  $('refDrop').style.display = m === 'file' ? 'block' : 'none';
-  $('modeUrl').style.background = m === 'url' ? 'var(--accent)' : '#222c40';
-  $('modeFile').style.background = m === 'file' ? 'var(--accent)' : '#222c40';
-  $('refPrev').style.display = 'none';
-  if(m === 'url' && $('s3url').value.trim()){ $('refPrev').src = $('s3url').value.trim(); $('refPrev').style.display='block'; }
-  if(m === 'file' && refURL){ $('refPrev').src = refURL; $('refPrev').style.display='block'; }
-  refreshBtn();
+// Read a Blob as a base64 data: URI (the API strips the "data:...;base64," prefix).
+function blobToDataURL(blob){
+  return new Promise((resolve, reject) => {
+    const fr = new FileReader();
+    fr.onload = () => resolve(fr.result);
+    fr.onerror = reject;
+    fr.readAsDataURL(blob);
+  });
 }
-function setRefFile(blob){
-  refBlob = blob;
-  if(refURL) URL.revokeObjectURL(refURL);
-  refURL = URL.createObjectURL(blob);
-  $('refPrev').src = refURL; $('refPrev').style.display = 'block';
-  $('refDropText').innerHTML = 'Document selected — click to change';
-  refreshBtn();
-}
-$('modeUrl').addEventListener('click', () => setRefMode('url'));
-$('modeFile').addEventListener('click', () => setRefMode('file'));
-$('refDrop').addEventListener('click', () => $('refFileInput').click());
-$('refFileInput').addEventListener('change', e => { if(e.target.files[0]) setRefFile(e.target.files[0]); });
-setRefMode('url');
 setMatchMode('face');
-setSelfieMode('local');
 
 $('drop').addEventListener('click', () => $('fileInput').click());
 $('fileInput').addEventListener('change', e => { if(e.target.files[0]) setLive(e.target.files[0]); });
@@ -247,19 +195,24 @@ $('snap').addEventListener('click', () => {
 $('verifyBtn').addEventListener('click', async () => {
   if(!hasSelfie() || !hasRef()) return;
   $('verifyBtn').disabled = true; $('status').textContent='Verifying…'; $('resultCard').style.display='none';
-  const fd = new FormData();
-  // selfie: file upload OR S3 URL (S3 selfie => server skips liveness, pure image match)
-  let selfieDisplay;
-  if(selfieMode === 'url'){ selfieDisplay = $('selfieUrl').value.trim(); fd.append('selfie_s3_url', selfieDisplay); }
-  else { selfieDisplay = liveURL; fd.append('file', liveBlob, 'live.jpg'); }
-  // reference / document: file upload OR S3 URL
-  const fileField = matchMode === 'doc' ? 'document_file' : 'reference_file';
+  const selfieDisplay = liveURL;
+  const liveB64 = await blobToDataURL(liveBlob);
+  const refDisplay = $('s3url').value.trim();
+  const payload = {};
+  if (matchMode === 'doc') {
+    // doc mode: the S3 document is the probe (face extracted, no liveness gate);
+    // the live capture stands in as the enrolled source-of-truth selfie.
+    payload.doc_check_s3 = refDisplay;
+    payload.source_selfie_b64 = liveB64;
+  } else {
+    // face mode: the live capture is the probe being verified (liveness runs on it);
+    // the S3 image is the enrolled source-of-truth selfie.
+    payload.face_check_b64 = liveB64;
+    payload.source_selfie_s3 = refDisplay;
+  }
   const endpoint = matchMode === 'doc' ? '/v1/faces/docmatch/verify' : '/v1/faces/facematch/verify';
-  let refDisplay;
-  if(refMode === 'url'){ refDisplay = $('s3url').value.trim(); fd.append('s3_url', refDisplay); }
-  else { refDisplay = refURL; fd.append(fileField, refBlob, 'reference.jpg'); }
   try{
-    const r = await fetch(endpoint, {method:'POST', body:fd});  // proxied to backend
+    const r = await fetch(endpoint, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)});  // proxied to backend
     const d = await r.json();
     if(!r.ok){
       $('status').innerHTML = '<span class="err">'+(d.detail?.message || d.detail || ('HTTP '+r.status))+'</span>';
@@ -274,7 +227,6 @@ function showResult(selfieUrl, url, d){
   $('status').textContent=''; $('resultCard').style.display='block';
   $('liveImg').src = selfieUrl; $('refImg').src = url; $('raw').textContent = JSON.stringify(d,null,2);
   const v = $('verdict');
-  // iqaPassed===false alone is NOT a failure (it's expected for S3->S3 no-liveness matches).
   if(d.decodeFailed || d.livenessFailed===true || d.faceDetected===false){
     const reason = d.livenessFailed===true ? 'Liveness failed — looks like a photo/screen'
       : d.faceDetected===false ? 'No face detected in the selfie'
@@ -287,7 +239,15 @@ function showResult(selfieUrl, url, d){
   v.textContent = vr.isMatch ? '✓ Match' : '✕ No match';
   v.className = 'verdict '+(vr.isMatch?'match':'nomatch');
   $('barFill').style.width = pct+'%';
-  $('scoreText').textContent = 'Similarity '+pct+'%  (threshold '+Math.round((vr.threshold ?? 0)*100)+'%)';
+  let line = 'Similarity '+pct+'%  (threshold '+Math.round((vr.threshold ?? 0)*100)+'%)';
+  const doc = d.documentFace;
+  if (doc && doc.sharpness != null) {
+    const blurry = doc.sharpness < 25;   // crisp ID photo > 100; blurry captures 5-20
+    line += '  •  doc sharpness '+doc.sharpness.toFixed(0)
+      + (blurry ? ' ⚠ low — retake the document photo (sharper, in focus, no glare)' : '');
+    if (!doc.usedCrop) line += '  •  ⚠ could not isolate the face on the card';
+  }
+  $('scoreText').textContent = line;
 }
 </script>
 </body>
@@ -332,7 +292,7 @@ class Handler(BaseHTTPRequestHandler):
             status = e.code
             ctype = e.headers.get("Content-Type", "application/json")
         except Exception as e:  # connection error to backend
-            data = f'{{"detail":"proxy_error: {e}"}}'.encode("utf-8")
+            data = f'{{"detail":"proxy_error: {e}"}}'.encode()
             status = 502
             ctype = "application/json"
         self.send_response(status)

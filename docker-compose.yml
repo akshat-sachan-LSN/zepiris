@@ -55,6 +55,7 @@ services:
       ZEPIRIS_API_TITLE: "ZepIris"
       ZEPIRIS_API_VERSION: "1.0.0"
       ZEPIRIS_VERIFY_THRESHOLD: "0.5"
+      ZEPIRIS_DOC_MIN_SHARPNESS: "0"
       # ML Inference service (main API encodes images to base64 and calls /v1/iqa/assess, /v1/face/embed)
       ZEPIRIS_ML_INFERENCE_SERVICE_URL: "http://ml-inference:8001"
     ports:

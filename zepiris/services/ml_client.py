@@ -54,14 +54,16 @@ class MLInferenceClient:
     as JSON for simpler HTTP communication.
     """
 
-    def __init__(self, base_url: str) -> None:
+    def __init__(self, base_url: str, timeout_seconds: float = 60.0) -> None:
         """Initialize ML inference client.
 
         Args:
             base_url: Base URL of the ML inference service, e.g. "http://localhost:8001"
+            timeout_seconds: Per-request timeout. CPU embedding with the detection
+                fallback cascade can far exceed httpx's 5s default.
         """
         self.base_url = base_url.rstrip("/")
-        self.client = httpx.Client(base_url=self.base_url)
+        self.client = httpx.Client(base_url=self.base_url, timeout=timeout_seconds)
 
     def _prepare_image_json(self, image_b64: str) -> dict:
         """Prepare JSON payload for an image in base64 format.
