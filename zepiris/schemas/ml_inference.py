@@ -10,11 +10,17 @@ class FaceEmbeddingResult(BaseModel):
         face_detected: Whether a face was found in the input image
         embedding: L2-normalized face embedding vector (zero vector when no face detected)
         embedding_dim: Dimension of the embedding vector
+        det_score: Detector confidence for the embedded face (None when no face).
+        face_sharpness: Variance-of-Laplacian of the detected face region, a focus
+            metric (None when no face). Lets a caller flag blurry inputs without a
+            second detection pass — a crisp face scores high, a blurry one low.
     """
 
     face_detected: bool
     embedding: list[float]
     embedding_dim: int
+    det_score: float | None = None
+    face_sharpness: float | None = None
 
 
 class FaceDetectionResult(BaseModel):

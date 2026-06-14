@@ -156,97 +156,26 @@ def _resolve_image_source(
     raise ImageSourceError(field=field, reason="missing")
 
 
-# Margin added around the detected document face before cropping; the extra
-# context lets the detector re-localize keypoints precisely on the crop.
-DOC_FACE_CROP_MARGIN = 0.35
-# Upscale tiny ID-card photos so the crop's shorter side reaches this many
-# pixels — keypoint alignment (and thus the embedding) is far better at size.
-DOC_FACE_MIN_SIDE = 320
-# If the detected face already fills the frame, cropping buys nothing.
-DOC_FACE_SKIP_AREA = 0.85
-
-
-def _sharpness(image_rgb: np.ndarray) -> float:
-    """Variance of the Laplacian — a cheap focus/blur metric (higher = sharper).
-
-    Computed on the extracted face at its native resolution (before any
-    upscaling, which would inflate the number). A crisp ID photo typically
-    scores > 100; blurry phone captures of a card fall in the single/low-double
-    digits.
-    """
-    gray = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2GRAY)
-    return float(cv2.Laplacian(gray, cv2.CV_64F).var())
-
-
-def _extract_doc_face(doc_rgb: np.ndarray, embedding_svc) -> tuple[np.ndarray | None, dict]:
-    """Split the face photo out of a document image (Aadhaar/PAN/licence scan).
-
-    Detects the primary face on the document, crops it with margin, and
-    upscales small crops so the recognition model sees a proper-sized face
-    instead of a tiny photo lost in the card layout.
-
-    Returns ``(crop, diag)``. ``crop`` is ``None`` when no usable face region is
-    found (caller falls back to embedding the full doc). ``diag`` always carries
-    what was observed — detection score, area fraction, and the crop's native
-    sharpness — so the response can explain a weak match.
-    """
-    diag: dict = {"faceDetected": False, "detScore": None, "sharpness": None}
-    det = embedding_svc.detect_box(doc_rgb)
-    diag["faceDetected"] = bool(det.face_detected)
-    if not det.face_detected:
-        return None, diag
-    diag["detScore"] = round(float(det.score), 4)
-
-    x1, y1, x2, y2 = det.bbox
-    if (x2 - x1) <= 0 or (y2 - y1) <= 0:
-        return None, diag
-    if (x2 - x1) * (y2 - y1) >= DOC_FACE_SKIP_AREA:
-        return None, diag  # already face-dominant; the normal path handles it best
-
-    h, w = doc_rgb.shape[:2]
-    mx = (x2 - x1) * w * DOC_FACE_CROP_MARGIN
-    my = (y2 - y1) * h * DOC_FACE_CROP_MARGIN
-    px1 = max(0, int(round(x1 * w - mx)))
-    py1 = max(0, int(round(y1 * h - my)))
-    px2 = min(w, int(round(x2 * w + mx)))
-    py2 = min(h, int(round(y2 * h + my)))
-    crop = doc_rgb[py1:py2, px1:px2]
-    if crop.size == 0 or min(crop.shape[:2]) < 8:
-        return None, diag
-
-    # Sharpness is measured on the native-resolution crop, before upscaling.
-    diag["sharpness"] = round(_sharpness(crop), 2)
-
-    ch, cw = crop.shape[:2]
-    if min(ch, cw) < DOC_FACE_MIN_SIDE:
-        scale = DOC_FACE_MIN_SIDE / min(ch, cw)
-        crop = cv2.resize(
-            crop,
-            (int(round(cw * scale)), int(round(ch * scale))),
-            interpolation=cv2.INTER_CUBIC,
-        )
-    return crop, diag
-
-
 def _embed_probe(probe_rgb: np.ndarray, embedding_svc, *, is_document: bool):
     """Embed the incoming probe image, returning ``(embedding, doc_diag)``.
 
-    For a document, the face photo is first split out (crop + upscale) and
-    embedded on its own, falling back to the full image when extraction fails.
-    ``doc_diag`` is ``None`` for a plain face probe, else the extraction
-    diagnostics (detection score, sharpness, whether the crop was used).
+    The embedding service runs a single detection cascade (primary → low-thresh →
+    upscale) that already recovers small/printed document faces, then recognizes
+    the face it finds — so a document is embedded directly, in one detection
+    pass, with no separate locate-and-crop step (measured: same match score,
+    ~half the latency). ``doc_diag`` is ``None`` for a plain face probe, else the
+    document-face diagnostics (detection score + face sharpness) the embed
+    returned, used to flag a blurry capture.
     """
+    result = embedding_svc.embed(probe_rgb)
     if not is_document:
-        return embedding_svc.embed(probe_rgb), None
-
-    face_crop, diag = _extract_doc_face(probe_rgb, embedding_svc)
-    diag["usedCrop"] = False
-    if face_crop is not None:
-        crop_embed = embedding_svc.embed(face_crop)
-        if crop_embed.face_detected:
-            diag["usedCrop"] = True
-            return crop_embed, diag
-    return embedding_svc.embed(probe_rgb), diag
+        return result, None
+    diag = {
+        "faceDetected": bool(result.face_detected),
+        "detScore": round(result.det_score, 4) if result.det_score is not None else None,
+        "sharpness": result.face_sharpness,
+    }
+    return result, diag
 
 
 def _run_verify(
@@ -329,7 +258,7 @@ def _run_verify(
     if doc_diag is not None:
         sharp = doc_diag.get("sharpness")
         low = (
-            min_sharpness > 0 and doc_diag.get("usedCrop") and sharp is not None
+            min_sharpness > 0 and doc_diag.get("faceDetected") and sharp is not None
             and sharp < min_sharpness
         )
         doc_diag["lowQuality"] = bool(low)

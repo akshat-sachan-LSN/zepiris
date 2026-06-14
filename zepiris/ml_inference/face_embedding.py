@@ -287,47 +287,65 @@ class FaceEmbeddingService(ModelService):
 
         return {"image": image_rgb, "face": None}
 
-    def predict(self, preprocessed_data: dict) -> tuple[np.ndarray, bool]:
+    @staticmethod
+    def _face_region_sharpness(image_rgb: np.ndarray, face: Face) -> float | None:
+        """Variance-of-Laplacian over the detected face box — a cheap focus metric.
+
+        Measured on the native-resolution face region the recognizer saw, so the
+        document path can flag a blurry capture without a separate detection pass.
+        """
+        h, w = image_rgb.shape[:2]
+        x1, y1, x2, y2 = (int(round(v)) for v in face.bbox[:4])
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(w, x2), min(h, y2)
+        if x2 <= x1 or y2 <= y1:
+            return None
+        region = image_rgb[y1:y2, x1:x2]
+        if region.size == 0:
+            return None
+        gray = cv2.cvtColor(region, cv2.COLOR_RGB2GRAY)
+        return round(float(cv2.Laplacian(gray, cv2.CV_64F).var()), 2)
+
+    def predict(self, preprocessed_data: dict) -> tuple:
         """Extract embedding for the detected face using the recognition model.
 
         Args:
             preprocessed_data: dict with "image" and "face" keys from preprocess()
 
         Returns:
-            tuple[np.ndarray, bool]: Face embedding (shape (512,), dtype float32)
-                                     and face_detected flag (True if face was found)
+            tuple: (embedding (512,), face_detected, det_score, face_sharpness).
         """
         face = preprocessed_data["face"]
         if face is None:
-            return np.zeros(self._embedding_dim, dtype=np.float32), False
+            return np.zeros(self._embedding_dim, dtype=np.float32), False, None, None
 
         app = self.load_model()
         rec = app.models["recognition"]
+        image = preprocessed_data["image"]
 
         if not self._enable_flip_tta:
-            embedding = rec.get(preprocessed_data["image"], face)
-            return np.asarray(embedding, dtype=np.float32), True
+            embedding = rec.get(image, face)
+        else:
+            # Flip test-time augmentation: align the face once (keypoint-driven warp),
+            # then average the embedding of the aligned crop and its horizontal mirror.
+            # Summing here is fine — postprocess() L2-normalizes the result.
+            aligned = face_align.norm_crop(image, landmark=face.kps, image_size=rec.input_size[0])
+            embedding = rec.get_feat(aligned).flatten() + rec.get_feat(cv2.flip(aligned, 1)).flatten()
 
-        # Flip test-time augmentation: align the face once (keypoint-driven warp),
-        # then average the embedding of the aligned crop and its horizontal mirror.
-        # Summing here is fine — postprocess() L2-normalizes the result.
-        aligned = face_align.norm_crop(
-            preprocessed_data["image"], landmark=face.kps, image_size=rec.input_size[0]
-        )
-        embedding = rec.get_feat(aligned).flatten() + rec.get_feat(cv2.flip(aligned, 1)).flatten()
+        det_score = float(getattr(face, "det_score", 0.0) or 0.0)
+        sharpness = self._face_region_sharpness(image, face)
+        return np.asarray(embedding, dtype=np.float32), True, det_score, sharpness
 
-        return np.asarray(embedding, dtype=np.float32), True
-
-    def postprocess(self, output: tuple[np.ndarray, bool]) -> FaceEmbeddingResult:
+    def postprocess(self, output: tuple) -> FaceEmbeddingResult:
         """L2-normalize embedding and wrap in result schema.
 
         Args:
-            output: Tuple of (embedding, face_detected) from predict()
+            output: (embedding, face_detected, det_score, face_sharpness) from predict()
 
         Returns:
-            FaceEmbeddingResult: Normalized embedding with face detection status and metadata
+            FaceEmbeddingResult: Normalized embedding with detection status and metadata
         """
-        embedding, face_detected = output
+        embedding, face_detected, det_score, sharpness = output
 
         norm = np.linalg.norm(embedding)
         if norm > 0:
@@ -338,6 +356,8 @@ class FaceEmbeddingService(ModelService):
             face_detected=face_detected,
             embedding=embedding_list,
             embedding_dim=len(embedding_list),
+            det_score=det_score,
+            face_sharpness=sharpness,
         )
 
     def detect_box(self, image_rgb: np.ndarray) -> FaceDetectionResult:

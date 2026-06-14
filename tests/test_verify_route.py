@@ -50,24 +50,29 @@ class _IQA:
 
 
 class _Embedding:
-    def __init__(self, *, live_vec, ref_vec, face=True, extra_vecs=None, doc_bbox=None) -> None:
+    def __init__(
+        self, *, live_vec, ref_vec, face=True, extra_vecs=None, det_score=0.9, sharpness=50.0
+    ) -> None:
         self._vecs = [live_vec, ref_vec, *(extra_vecs or [])]
         self._face = face
-        # Full-frame box by default -> doc extraction is skipped (face-dominant image).
-        self._doc_bbox = doc_bbox if doc_bbox is not None else [0.0, 0.0, 1.0, 1.0]
+        self._det_score = det_score
+        self._sharpness = sharpness
         self.embedded_shapes: list[tuple] = []
 
     def embed(self, image_rgb) -> FaceEmbeddingResult:
         self.embedded_shapes.append(image_rgb.shape)
         vec = self._vecs.pop(0)
+        detected = self._face if vec is not None else False
         return FaceEmbeddingResult(
-            face_detected=self._face if vec is not None else False,
+            face_detected=detected,
             embedding=vec or [],
             embedding_dim=len(vec or []),
+            det_score=self._det_score if detected else None,
+            face_sharpness=self._sharpness if detected else None,
         )
 
     def detect_box(self, image_rgb) -> FaceDetectionResult:
-        return FaceDetectionResult(face_detected=True, bbox=self._doc_bbox, score=0.9)
+        return FaceDetectionResult(face_detected=True, bbox=[0.0, 0.0, 1.0, 1.0], score=0.9)
 
 
 class _Fetcher:
@@ -207,16 +212,15 @@ def test_recorded_sample_includes_quality_scores() -> None:
 
 
 def test_docmatch_reports_document_face_diagnostics() -> None:
-    """docmatch surfaces a documentFace block (detection score, sharpness, crop used)."""
+    """docmatch surfaces a documentFace block (detection score, sharpness) from the embed."""
     vec = [1.0, 0.0, 0.0]
-    embedding = _Embedding(live_vec=vec, ref_vec=vec, doc_bbox=[0.05, 0.2, 0.25, 0.7])
-    client = _client(_IQA(), embedding, _Fetcher(_doc_jpeg_bytes()))
+    embedding = _Embedding(live_vec=vec, ref_vec=vec, det_score=0.87, sharpness=42.0)
+    client = _client(_IQA(), embedding, _Fetcher(_jpeg_bytes()))
     body = _post(client, path="/v1/faces/docmatch/verify", s3_url="https://s3/aadhaar.jpg").json()
     doc = body["documentFace"]
     assert doc["faceDetected"] is True
-    assert doc["usedCrop"] is True
-    assert doc["detScore"] == pytest.approx(0.9)
-    assert "sharpness" in doc
+    assert doc["detScore"] == pytest.approx(0.87)
+    assert doc["sharpness"] == pytest.approx(42.0)
     assert doc["lowQuality"] is False  # min_sharpness disabled by default
 
 
@@ -228,13 +232,13 @@ def test_facematch_has_no_document_face_block() -> None:
 
 
 def test_docmatch_rejects_too_blurry_document_when_gate_enabled() -> None:
-    """With doc_min_sharpness set, a sub-threshold extracted face is rejected (422)."""
+    """With doc_min_sharpness set, a sub-threshold document face is rejected (422)."""
 
     class _StrictSettings(_Settings):
-        doc_min_sharpness = 1000.0  # higher than any real crop -> always too blurry
+        doc_min_sharpness = 25.0
 
     vec = [1.0, 0.0, 0.0]
-    embedding = _Embedding(live_vec=vec, ref_vec=vec, doc_bbox=[0.05, 0.2, 0.25, 0.7])
+    embedding = _Embedding(live_vec=vec, ref_vec=vec, sharpness=6.8)  # below the gate
     app = FastAPI()
     register_exception_handlers(app)
     app.include_router(face_routes.router, prefix="/v1/faces")
@@ -242,7 +246,7 @@ def test_docmatch_rejects_too_blurry_document_when_gate_enabled() -> None:
     app.dependency_overrides[IQADep.__metadata__[0].dependency] = lambda: _IQA()
     app.dependency_overrides[EmbeddingDep.__metadata__[0].dependency] = lambda: embedding
     app.dependency_overrides[S3FetcherDep.__metadata__[0].dependency] = lambda: _Fetcher(
-        _doc_jpeg_bytes()
+        _jpeg_bytes()
     )
     app.dependency_overrides[LearnerDep.__metadata__[0].dependency] = lambda: _Learner()
     client = TestClient(app)
@@ -268,59 +272,17 @@ def test_docmatch_does_not_run_liveness() -> None:
     assert "livenessFailed" not in body
 
 
-def _doc_jpeg_bytes(h: int = 400, w: int = 640) -> bytes:
-    """A document-sized image (landscape card scan) for doc-extraction tests."""
-    img = np.zeros((h, w, 3), dtype=np.uint8)
-    ok, buf = cv2.imencode(".jpg", img)
-    assert ok
-    return buf.tobytes()
-
-
-def test_docmatch_embeds_extracted_face_crop() -> None:
-    """docmatch splits the face photo out of the uploaded document and embeds the crop.
-
-    The detected box is small (an ID-card photo), so the probe (doc_check)
-    embedding must run on a cropped, upscaled face image — not on the full
-    document scan. The probe is embedded first, the source selfie second.
-    """
+def test_docmatch_embeds_document_in_one_pass() -> None:
+    """docmatch embeds the document directly (no separate locate+crop detection)."""
     vec = [1.0, 0.0, 0.0]
-    embedding = _Embedding(
-        live_vec=vec, ref_vec=vec, doc_bbox=[0.05, 0.2, 0.25, 0.7]
-    )  # face occupies a small corner of the card
-    client = _client(_IQA(), embedding, _Fetcher(_doc_jpeg_bytes()))
+    embedding = _Embedding(live_vec=vec, ref_vec=vec)
+    client = _client(_IQA(), embedding, _Fetcher(_jpeg_bytes()))
     r = _post(client, path="/v1/faces/docmatch/verify", s3_url="https://s3/aadhaar.jpg")
     assert r.status_code == 200
     assert r.json()["verificationResult"]["isMatch"] is True
-
-    probe_shape, _source_shape = embedding.embedded_shapes
-    assert probe_shape != (400, 640, 3)  # not the full document
-    assert min(probe_shape[:2]) >= face_routes.DOC_FACE_MIN_SIDE  # upscaled crop
-
-
-def test_docmatch_falls_back_to_full_document_when_crop_has_no_face() -> None:
-    """If embedding the extracted crop finds no face, the full document is embedded."""
-    vec = [1.0, 0.0, 0.0]
-    embedding = _Embedding(
-        live_vec=None,  # crop attempt (embedded first) -> no face detected
-        ref_vec=vec,  # full-document fallback succeeds
-        extra_vecs=[vec],  # source selfie
-        doc_bbox=[0.05, 0.2, 0.25, 0.7],
-    )
-    client = _client(_IQA(), embedding, _Fetcher(_doc_jpeg_bytes()))
-    r = _post(client, path="/v1/faces/docmatch/verify", s3_url="https://s3/aadhaar.jpg")
-    assert r.status_code == 200
-    assert r.json()["verificationResult"]["isMatch"] is True
-    assert (400, 640, 3) in embedding.embedded_shapes  # fell back to full doc
-
-
-def test_facematch_never_runs_doc_extraction() -> None:
-    """facematch embeds the incoming face as-is even when a small box is reported."""
-    vec = [1.0, 0.0, 0.0]
-    embedding = _Embedding(live_vec=vec, ref_vec=vec, doc_bbox=[0.05, 0.2, 0.25, 0.7])
-    client = _client(_IQA(), embedding, _Fetcher(_doc_jpeg_bytes()))
-    r = _post(client, s3_url="https://s3/ref.jpg")
-    assert r.status_code == 200
-    assert embedding.embedded_shapes[0] == (400, 640, 3)  # full probe image, no crop
+    # exactly two embeds: the document probe, then the source selfie — no extra
+    # detection/crop pass.
+    assert len(embedding.embedded_shapes) == 2
 
 
 def test_docmatch_uses_learned_threshold_for_doc_type() -> None:
