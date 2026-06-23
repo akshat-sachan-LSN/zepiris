@@ -247,25 +247,21 @@ def _run_verify(
         }
 
     ml_struct = None
+    liveness_failed = False
     if run_liveness:
         ml_struct = iqa_svc.assess(probe_rgb, _to_bgr_b64(probe_rgb))
 
-        if not ml_struct.spoof.is_live:
-            return {
-                "requestId": request_id,
-                "imageQualityAssessment": ml_struct.model_dump(),
-                "iqaPassed": False,
-                "livenessFailed": True,
-                "faceDetected": False,
-                "verificationResult": _verification_result(False, None),
-                "scores": _scores_dict(None, decision_threshold, ml_struct),
-            }
+        # Liveness no longer short-circuits: a non-live probe is still matched
+        # and scored, but the decision is forced to isMatch=false below.
+        liveness_failed = not ml_struct.spoof.is_live
 
-        if not ml_struct.passed:
+        # NSFW + blur quality still blocks; only liveness is non-blocking.
+        if not (ml_struct.nsfw.is_safe and ml_struct.blur.is_sharp):
             return {
                 "requestId": request_id,
                 "imageQualityAssessment": ml_struct.model_dump(),
                 "iqaPassed": False,
+                "livenessFailed": liveness_failed,
                 "faceDetected": False,
                 "verificationResult": _verification_result(False, None),
                 "scores": _scores_dict(None, decision_threshold, ml_struct),
@@ -306,13 +302,13 @@ def _run_verify(
         raise ReferenceFaceNotFoundError()
 
     score = cosine(probe_embed.embedding, reference_embed.embedding)
-    is_match = score >= decision_threshold
+    is_match = bool(score >= decision_threshold and not liveness_failed)
 
-    return VerifyResponse(
+    response = VerifyResponse(
         request_id=request_id,
         image_quality_assessment=ml_struct,
         verification_result=VerificationResult(
-            is_match=bool(is_match),
+            is_match=is_match,
             score=score,
             threshold=decision_threshold,
             threshold_source=threshold_source,
@@ -320,8 +316,11 @@ def _run_verify(
         scores=VerificationScores(**_scores_dict(score, decision_threshold, ml_struct)),
         document_face=doc_diag,
         face_detected=True,
-        iqa_passed=True,
+        iqa_passed=not liveness_failed,
     ).model_dump(by_alias=True)
+    if liveness_failed:
+        response["livenessFailed"] = True
+    return response
 
 
 @router.post("/facematch/verify")
