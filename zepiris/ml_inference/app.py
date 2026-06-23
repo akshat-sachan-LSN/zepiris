@@ -62,8 +62,9 @@ class MLServiceSettings(BaseSettings):
     spoof_onnx_model_path: str = "/app/models/minifasnet_v2_yakhyo.onnx"
     spoof_onnx_model_path_2: str = "/app/models/minifasnet_v1se_yakhyo.onnx"
     # prob_live (MiniFASNet class 1 = real) must exceed this to be considered
-    # live. Real faces tested at 0.62-1.0; 0.5 leaves margin without locking out.
-    spoof_onnx_live_threshold: float = 0.5
+    # live. Real faces tested at 0.62-1.0; 0.4 widens the live band to reduce
+    # false liveness rejections on borderline real selfies.
+    spoof_onnx_live_threshold: float = 0.4
 
     # Legacy MobileNetV3 spoof model (used only when spoof_engine == "mobilenet").
     spoof_model_source: str = "auto"
@@ -83,6 +84,11 @@ class MLServiceSettings(BaseSettings):
     blur_threshold: float = 0.5
 
     face_embedding_dim: int = 512
+    # Detector input size. 640x640 is the validated operating point. Lowering it
+    # (e.g. 320) roughly halves detection latency and leaves *recognition* match
+    # scores unchanged, BUT it shifts the face box the MiniFASNet liveness models
+    # crop from — and those models are crop-sensitive, so it can flip is_live
+    # decisions. Do not lower without re-validating liveness on real selfies.
     face_detection_width: int = 640
     face_detection_height: int = 640
     face_area_threshold: float = 0.01

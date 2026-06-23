@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import shutil
+import threading
+from collections import OrderedDict
 
 import cv2
 import numpy as np
@@ -87,6 +90,16 @@ class FaceEmbeddingService(ModelService):
         self._upscale_max_side = upscale_max_side
         self._enable_flip_tta = enable_flip_tta
         self._face_app: FaceAnalysis | None = None
+        # Short-lived memo of the detector's raw output, keyed by image content +
+        # threshold. A facematch sends the same probe image to the liveness path
+        # (which detects to crop for MiniFASNet) and then to the embed path
+        # (which detects again) — two HTTP calls, same pixels. detect() is a pure
+        # function of (image, det_thresh, det_size), so caching its result lets
+        # the second call skip a full detection with no behavioural change.
+        # Bounded LRU; nothing is persisted beyond the last few requests.
+        self._det_cache: OrderedDict[bytes, tuple] = OrderedDict()
+        self._det_cache_lock = threading.Lock()
+        self._det_cache_max = 16
         config = ModelServiceConfig(
             model_name="face_embedding",
             device=device,
@@ -155,6 +168,41 @@ class FaceEmbeddingService(ModelService):
         except OSError:
             pass
 
+    def _detect(self, image_rgb: np.ndarray, det_thresh: float | None) -> tuple:
+        """Run the detector, memoizing its output per (image content, threshold).
+
+        ``app.det_model.detect`` is deterministic in (image, det_thresh, det_size),
+        so the same probe image hitting the liveness path and then the embed path
+        reuses one detection instead of running two. Returns ``(bboxes, kpss)``.
+        """
+        app = self.load_model()
+        eff_thresh = det_thresh if det_thresh is not None else getattr(app.det_model, "det_thresh", None)
+        digest = hashlib.blake2b(np.ascontiguousarray(image_rgb), digest_size=16).digest()
+        key = b"%s|%r|%r" % (digest, eff_thresh, image_rgb.shape)
+
+        with self._det_cache_lock:
+            cached = self._det_cache.get(key)
+            if cached is not None:
+                self._det_cache.move_to_end(key)
+                return cached
+
+        if det_thresh is not None and hasattr(app.det_model, "det_thresh"):
+            prev = app.det_model.det_thresh
+            app.det_model.det_thresh = det_thresh
+            try:
+                result = app.det_model.detect(image_rgb, max_num=0, metric="default")
+            finally:
+                app.det_model.det_thresh = prev
+        else:
+            result = app.det_model.detect(image_rgb, max_num=0, metric="default")
+
+        with self._det_cache_lock:
+            self._det_cache[key] = result
+            self._det_cache.move_to_end(key)
+            while len(self._det_cache) > self._det_cache_max:
+                self._det_cache.popitem(last=False)
+        return result
+
     def _select_face(self, image_rgb: np.ndarray, det_thresh: float | None = None) -> Face | None:
         """Detect faces and select the best one for recognition.
 
@@ -169,17 +217,7 @@ class FaceEmbeddingService(ModelService):
         Returns the chosen ``Face`` (detection + keypoints) or ``None`` when the
         detector finds nothing.
         """
-        app = self.load_model()
-
-        if det_thresh is not None and hasattr(app.det_model, "det_thresh"):
-            prev = app.det_model.det_thresh
-            app.det_model.det_thresh = det_thresh
-            try:
-                bboxes, kpss = app.det_model.detect(image_rgb, max_num=0, metric="default")
-            finally:
-                app.det_model.det_thresh = prev
-        else:
-            bboxes, kpss = app.det_model.detect(image_rgb, max_num=0, metric="default")
+        bboxes, kpss = self._detect(image_rgb, det_thresh)
 
         if len(bboxes) == 0:
             return None

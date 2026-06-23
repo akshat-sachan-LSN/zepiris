@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
 import uuid
@@ -108,8 +109,13 @@ def _decode_rgb(raw: bytes) -> np.ndarray | None:
 
 
 def _to_bgr_b64(image_rgb: np.ndarray) -> str:
-    # The ML service decodes JPEG as BGR then converts BGR->RGB, so hand it BGR.
-    ok, buf = cv2.imencode(".jpg", cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR))
+    # The ML service decodes as BGR then converts BGR->RGB, so hand it BGR.
+    # PNG (lossless), and encoded identically to the embed path's payload, so the
+    # probe the liveness call sends is byte-for-byte the probe the embed call
+    # sends — letting the ML detector memoize one detection across both calls
+    # instead of detecting the same face twice. (Liveness on lossless vs the old
+    # 2nd-generation JPEG differs by <0.005 in measured prob_live.)
+    ok, buf = cv2.imencode(".png", cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR))
     if not ok:
         raise ImageEncodeError()
     return base64.b64encode(buf.tobytes()).decode("utf-8")
@@ -154,6 +160,22 @@ def _resolve_image_source(
     if has_s3:
         return fetcher.fetch(s3_url.strip())
     raise ImageSourceError(field=field, reason="missing")
+
+
+async def _resolve_two_sources(
+    *, probe_kwargs: dict, reference_kwargs: dict
+) -> tuple[bytes, bytes]:
+    """Resolve the probe and reference images concurrently.
+
+    Both sides are independent network/decode work; fetching them in parallel
+    (off the event loop) removes one S3 round-trip from the critical path when
+    both arrive as S3 URLs. Base64 inputs resolve instantly either way.
+    """
+    probe_raw, reference_raw = await asyncio.gather(
+        asyncio.to_thread(_resolve_image_source, **probe_kwargs),
+        asyncio.to_thread(_resolve_image_source, **reference_kwargs),
+    )
+    return probe_raw, reference_raw
 
 
 def _embed_probe(probe_rgb: np.ndarray, embedding_svc, *, is_document: bool):
@@ -321,17 +343,20 @@ async def facematch_verify(
     side is rejected.
     """
     request_id = str(uuid.uuid4())
-    probe_raw = _resolve_image_source(
-        b64=req.face_check_b64, s3_url=req.face_check_s3, fetcher=fetcher, field="face_check"
-    )
-    reference_raw = _resolve_image_source(
-        b64=req.source_selfie_b64, s3_url=req.source_selfie_s3, fetcher=fetcher,
-        field="source_selfie",
+    probe_raw, reference_raw = await _resolve_two_sources(
+        probe_kwargs=dict(
+            b64=req.face_check_b64, s3_url=req.face_check_s3, fetcher=fetcher, field="face_check"
+        ),
+        reference_kwargs=dict(
+            b64=req.source_selfie_b64, s3_url=req.source_selfie_s3, fetcher=fetcher,
+            field="source_selfie",
+        ),
     )
     decision_threshold, threshold_source = _resolve_threshold(
         req.threshold, learner, FACE_KIND, settings.verify_threshold
     )
-    body = _run_verify(
+    body = await asyncio.to_thread(
+        _run_verify,
         request_id=request_id,
         probe_raw=probe_raw,
         reference_raw=reference_raw,
@@ -370,18 +395,21 @@ async def docmatch_verify(
     from operator feedback, since Aadhaar and PAN photos score differently.
     """
     request_id = str(uuid.uuid4())
-    probe_raw = _resolve_image_source(
-        b64=req.doc_check_b64, s3_url=req.doc_check_s3, fetcher=fetcher, field="doc_check"
-    )
-    reference_raw = _resolve_image_source(
-        b64=req.source_selfie_b64, s3_url=req.source_selfie_s3, fetcher=fetcher,
-        field="source_selfie",
+    probe_raw, reference_raw = await _resolve_two_sources(
+        probe_kwargs=dict(
+            b64=req.doc_check_b64, s3_url=req.doc_check_s3, fetcher=fetcher, field="doc_check"
+        ),
+        reference_kwargs=dict(
+            b64=req.source_selfie_b64, s3_url=req.source_selfie_s3, fetcher=fetcher,
+            field="source_selfie",
+        ),
     )
     doc_kind = (req.doc_type or GENERIC_DOC_TYPE).strip().lower() or GENERIC_DOC_TYPE
     decision_threshold, threshold_source = _resolve_threshold(
         req.threshold, learner, doc_kind, settings.doc_verify_threshold
     )
-    body = _run_verify(
+    body = await asyncio.to_thread(
+        _run_verify,
         request_id=request_id,
         probe_raw=probe_raw,
         reference_raw=reference_raw,
