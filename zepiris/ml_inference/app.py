@@ -47,6 +47,10 @@ class MLServiceSettings(BaseSettings):
 
     ml_device: str = "cpu"
 
+    # Face-match-only mode: skip loading NSFW/spoof/blur models so the service
+    # starts faster and lighter. IQA is disabled; only face embedding loads.
+    face_match_only: bool = True
+
     nsfw_model_source: str = "auto"
     nsfw_hf_repo_id: str = ""
     nsfw_hf_model_file: str = "nsfw_model.pth"
@@ -132,20 +136,25 @@ async def lifespan(app: FastAPI):
     logger.info("Loading ML models on device=%s …", device)
     failed: list[str] = []
 
-    try:
-        app.state.nsfw_service = NSFWDetectionService(
-            huggingface_repo_id=s.nsfw_hf_repo_id,
-            huggingface_model_file=s.nsfw_hf_model_file,
-            local_model_path=s.nsfw_local_model_path or None,
-            model_source=s.nsfw_model_source,
-            nsfw_threshold=s.nsfw_threshold,
-            device=device,
-        )
-        app.state.nsfw_service.load_model()
-    except Exception:
-        logger.exception("Failed to load NSFWDetectionService")
-        app.state.nsfw_service = None
-        failed.append("nsfw")
+    app.state.nsfw_service = None
+    app.state.spoof_service = None
+    app.state.blur_service = None
+
+    if not s.face_match_only:
+        try:
+            app.state.nsfw_service = NSFWDetectionService(
+                huggingface_repo_id=s.nsfw_hf_repo_id,
+                huggingface_model_file=s.nsfw_hf_model_file,
+                local_model_path=s.nsfw_local_model_path or None,
+                model_source=s.nsfw_model_source,
+                nsfw_threshold=s.nsfw_threshold,
+                device=device,
+            )
+            app.state.nsfw_service.load_model()
+        except Exception:
+            logger.exception("Failed to load NSFWDetectionService")
+            app.state.nsfw_service = None
+            failed.append("nsfw")
 
     # Face embedding/detector first — the ONNX spoof engine reuses its detector
     # to crop the face for MiniFASNet.
@@ -184,68 +193,69 @@ async def lifespan(app: FastAPI):
         logger.info("Spoof engine: legacy MobileNetV3")
         return svc
 
-    try:
-        screen_detector = (
-            ScreenReplayDetector(threshold=s.spoof_screen_threshold)
-            if s.spoof_screen_detection_enabled
-            else None
-        )
-        if s.spoof_engine == "onnx":
-            # Resolve each model path: fall back to ./models when the configured
-            # (container) path is absent, so native launches work without extra env.
-            def _resolve(path: str) -> str | None:
-                if Path(path).exists():
-                    return path
-                cwd_path = Path.cwd() / "models" / Path(path).name
-                if cwd_path.exists():
-                    logger.warning("ONNX model not at %s; using %s", path, cwd_path)
-                    return str(cwd_path)
-                return None
+    if not s.face_match_only:
+        try:
+            screen_detector = (
+                ScreenReplayDetector(threshold=s.spoof_screen_threshold)
+                if s.spoof_screen_detection_enabled
+                else None
+            )
+            if s.spoof_engine == "onnx":
+                # Resolve each model path: fall back to ./models when the configured
+                # (container) path is absent, so native launches work without extra env.
+                def _resolve(path: str) -> str | None:
+                    if Path(path).exists():
+                        return path
+                    cwd_path = Path.cwd() / "models" / Path(path).name
+                    if cwd_path.exists():
+                        logger.warning("ONNX model not at %s; using %s", path, cwd_path)
+                        return str(cwd_path)
+                    return None
 
-            # (path, crop_scale): V2 at 2.7x, V1SE at 4.0x (canonical Silent-Face).
-            candidates = [
-                (_resolve(s.spoof_onnx_model_path), 2.7),
-                (_resolve(s.spoof_onnx_model_path_2), 4.0),
-            ]
-            models = [(p, scale) for p, scale in candidates if p is not None]
-            face_svc = app.state.face_embedding_service
-            try:
-                if face_svc is None:
-                    raise RuntimeError("face detector unavailable")
-                if not models:
-                    raise FileNotFoundError("no MiniFASNet ONNX models found")
-                app.state.spoof_service = OnnxSpoofDetectionService(
-                    models=models,
-                    face_detector=face_svc.detect_box,
-                    live_threshold=s.spoof_onnx_live_threshold,
-                    screen_replay_detector=screen_detector,
-                )
-                app.state.spoof_service.load_model()
-                logger.info("Spoof engine: MiniFASNet ONNX ensemble (%d model(s))", len(models))
-            except Exception:
-                logger.exception("ONNX spoof engine failed; falling back to MobileNetV3")
+                # (path, crop_scale): V2 at 2.7x, V1SE at 4.0x (canonical Silent-Face).
+                candidates = [
+                    (_resolve(s.spoof_onnx_model_path), 2.7),
+                    (_resolve(s.spoof_onnx_model_path_2), 4.0),
+                ]
+                models = [(p, scale) for p, scale in candidates if p is not None]
+                face_svc = app.state.face_embedding_service
+                try:
+                    if face_svc is None:
+                        raise RuntimeError("face detector unavailable")
+                    if not models:
+                        raise FileNotFoundError("no MiniFASNet ONNX models found")
+                    app.state.spoof_service = OnnxSpoofDetectionService(
+                        models=models,
+                        face_detector=face_svc.detect_box,
+                        live_threshold=s.spoof_onnx_live_threshold,
+                        screen_replay_detector=screen_detector,
+                    )
+                    app.state.spoof_service.load_model()
+                    logger.info("Spoof engine: MiniFASNet ONNX ensemble (%d model(s))", len(models))
+                except Exception:
+                    logger.exception("ONNX spoof engine failed; falling back to MobileNetV3")
+                    app.state.spoof_service = _build_mobilenet_spoof(screen_detector)
+            else:
                 app.state.spoof_service = _build_mobilenet_spoof(screen_detector)
-        else:
-            app.state.spoof_service = _build_mobilenet_spoof(screen_detector)
-    except Exception:
-        logger.exception("Failed to load spoof service")
-        app.state.spoof_service = None
-        failed.append("spoof")
+        except Exception:
+            logger.exception("Failed to load spoof service")
+            app.state.spoof_service = None
+            failed.append("spoof")
 
-    try:
-        app.state.blur_service = BlurDetectionService(
-            huggingface_repo_id=s.blur_hf_repo_id,
-            huggingface_model_file=s.blur_hf_model_file,
-            local_model_path=s.blur_local_model_path or None,
-            model_source=s.blur_model_source,
-            blur_threshold=s.blur_threshold,
-            device=device,
-        )
-        app.state.blur_service.load_model()
-    except Exception:
-        logger.exception("Failed to load BlurDetectionService")
-        app.state.blur_service = None
-        failed.append("blur")
+        try:
+            app.state.blur_service = BlurDetectionService(
+                huggingface_repo_id=s.blur_hf_repo_id,
+                huggingface_model_file=s.blur_hf_model_file,
+                local_model_path=s.blur_local_model_path or None,
+                model_source=s.blur_model_source,
+                blur_threshold=s.blur_threshold,
+                device=device,
+            )
+            app.state.blur_service.load_model()
+        except Exception:
+            logger.exception("Failed to load BlurDetectionService")
+            app.state.blur_service = None
+            failed.append("blur")
 
     nsfw = app.state.nsfw_service
     spoof = app.state.spoof_service
