@@ -155,3 +155,61 @@ def test_low_threshold_fallback_recovers_faint_face(monkeypatch) -> None:
     out = service.preprocess(img)
     assert out["face"] is not None              # recovered via the low-thresh retry
     assert any(t <= 0.35 for t in det.calls)    # the fallback threshold was used
+
+
+class _OutOfBoundsDet:
+    """Detector returning a single box that spills well past the image's bottom
+    edge — a hallucinated/partial detection, not a real in-frame face. Mirrors the
+    spurious box that produced the -0.10 false reject on USER_2400121 (a box whose
+    y2 landed ~18% below the image height)."""
+
+    def detect(self, image, max_num=0, metric="default"):
+        h, w = image.shape[:2]
+        bbox = np.array([[w * 0.30, h * 0.75, w * 0.68, h * 1.18, 0.48]], dtype=np.float32)
+        kps = np.full((1, 5, 2), w * 0.4, dtype=np.float32)
+        return bbox, kps
+
+
+def test_out_of_bounds_detection_rejected(monkeypatch) -> None:
+    # A box extending far beyond the frame cannot be a fully-visible face; it must
+    # be discarded so the caller can retry (padding/upscale) instead of embedding it.
+    img = np.zeros((305, 300, 3), dtype=np.uint8)
+    service = FaceEmbeddingService()
+    monkeypatch.setattr(service, "load_model", lambda: _FakeApp(_OutOfBoundsDet()))
+    assert service._select_face(img) is None
+
+
+class _BorderSpillThenPaddedDet:
+    """Original image yields only a bottom-spilling (invalid) box; once padded, the
+    real frame-filling face is detected in-bounds — exactly the USER_2400121 case
+    where the low-threshold pass grabbed a partial off-frame box before the padding
+    retry could find the true face."""
+
+    def __init__(self, original_hw: tuple[int, int]) -> None:
+        self._original_hw = original_hw
+        self.calls: list[tuple[int, int]] = []
+
+    def detect(self, image, max_num=0, metric="default"):
+        h, w = image.shape[:2]
+        self.calls.append((h, w))
+        if (h, w) == self._original_hw:
+            bbox = np.array([[w * 0.30, h * 0.75, w * 0.68, h * 1.18, 0.48]], dtype=np.float32)
+            kps = np.full((1, 5, 2), w * 0.4, dtype=np.float32)
+            return bbox, kps
+        bbox = np.array([[w * 0.30, h * 0.25, w * 0.70, h * 0.72, 0.63]], dtype=np.float32)
+        kps = np.full((1, 5, 2), w * 0.5, dtype=np.float32)
+        return bbox, kps
+
+
+def test_border_spill_falls_through_to_padding(monkeypatch) -> None:
+    img = np.zeros((305, 300, 3), dtype=np.uint8)
+    service = FaceEmbeddingService(enable_upscale_retry=False)
+    det = _BorderSpillThenPaddedDet(original_hw=img.shape[:2])
+    monkeypatch.setattr(service, "load_model", lambda: _FakeApp(det))
+
+    result = service.preprocess(img)
+
+    assert result["face"] is not None
+    # The off-frame original detection was rejected, so recognition runs on the
+    # padded image where the real face was recovered.
+    assert result["image"].shape[:2] != img.shape[:2]

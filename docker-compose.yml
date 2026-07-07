@@ -29,9 +29,9 @@ services:
       ML_SERVICE_FACE_DET_THRESH: "0.5"
       # Fallback detection for hard faces (documents): used only when the primary
       # pass finds nothing, then a lower threshold + an upscaled retry kick in.
-      ML_SERVICE_FACE_LOW_DET_THRESH: "0.3"
+      ML_SERVICE_FACE_LOW_DET_THRESH: "0.05"
       ML_SERVICE_FACE_ENABLE_UPSCALE_RETRY: "true"
-      ML_SERVICE_FACE_UPSCALE_FACTOR: "2.0"
+      ML_SERVICE_FACE_UPSCALE_FACTOR: "3.0"
     volumes:
       # Persist the InsightFace buffalo_l weights (~300MB) downloaded on first
       # startup, so container recreates don't re-download them every time.

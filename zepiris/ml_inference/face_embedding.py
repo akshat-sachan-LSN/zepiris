@@ -41,6 +41,7 @@ class FaceEmbeddingService(ModelService):
         model_name: str = "buffalo_l",
         det_thresh: float = 0.5,
         low_det_thresh: float = 0.3,
+        bbox_bounds_tolerance: float = 0.05,
         enable_upscale_retry: bool = True,
         upscale_factor: float = 2.0,
         upscale_max_side: int = 2000,
@@ -67,6 +68,14 @@ class FaceEmbeddingService(ModelService):
             low_det_thresh: Fallback confidence used only when the primary pass finds
                 no face — recovers small/printed/low-contrast faces (e.g. the photo on
                 an Aadhaar/PAN document) at the cost of accepting weaker detections.
+            bbox_bounds_tolerance: How far a detection may extend past the image edge
+                before it is rejected as invalid, as a fraction of the image
+                width/height. A fully-visible face is bounded by the frame, so a box
+                spilling well past an edge is a hallucinated/partial detection; the
+                low-confidence fallback occasionally returns such a box (e.g. latching
+                onto a chin/neck region on a frame-filling selfie) which embeds as
+                garbage and silently tanks the match score. Rejecting it lets the
+                padding/upscale retries recover the real face instead.
             enable_upscale_retry: If True, when no face is found, retry on an upscaled
                 copy of the image. Small document faces detect far better when enlarged.
             upscale_factor: How much to enlarge on the upscale retry.
@@ -85,6 +94,7 @@ class FaceEmbeddingService(ModelService):
         self._model_name = model_name
         self._det_thresh = det_thresh
         self._low_det_thresh = low_det_thresh
+        self._bbox_bounds_tolerance = bbox_bounds_tolerance
         self._enable_upscale_retry = enable_upscale_retry
         self._upscale_factor = upscale_factor
         self._upscale_max_side = upscale_max_side
@@ -225,14 +235,32 @@ class FaceEmbeddingService(ModelService):
         h, w = image_rgb.shape[:2]
         img_area = h * w
 
-        filtered_indices = []
+        # Reject detections that extend substantially beyond the frame. A fully
+        # visible face is bounded by the image, so a box spilling well past an edge
+        # is a hallucinated/partial detection (typically a weak low-threshold hit on
+        # a chin/neck region of a frame-filling selfie). Embedding it yields a
+        # near-random vector that silently drives the match score negative; dropping
+        # it returns None so preprocess() falls through to the padding/upscale
+        # retries that recover the real face.
+        tol_x = w * self._bbox_bounds_tolerance
+        tol_y = h * self._bbox_bounds_tolerance
+        in_bounds = []
         for i, box in enumerate(bboxes):
             x1, y1, x2, y2 = box[:4]
+            if x1 >= -tol_x and y1 >= -tol_y and x2 <= w + tol_x and y2 <= h + tol_y:
+                in_bounds.append(i)
+
+        if not in_bounds:
+            return None
+
+        filtered_indices = []
+        for i in in_bounds:
+            x1, y1, x2, y2 = bboxes[i][:4]
             face_area = (x2 - x1) * (y2 - y1)
             if face_area / img_area > self._facial_area_threshold:
                 filtered_indices.append(i)
 
-        candidates = filtered_indices if filtered_indices else list(range(len(bboxes)))
+        candidates = filtered_indices if filtered_indices else in_bounds
 
         def _rank(i: int) -> tuple[float, float]:
             x1, y1, x2, y2 = bboxes[i][:4]
