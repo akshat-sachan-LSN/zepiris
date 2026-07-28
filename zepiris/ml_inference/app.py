@@ -88,13 +88,13 @@ class MLServiceSettings(BaseSettings):
     blur_threshold: float = 0.5
 
     face_embedding_dim: int = 512
-    # Detector input size. 640x640 is the validated operating point. Lowering it
-    # (e.g. 320) roughly halves detection latency and leaves *recognition* match
-    # scores unchanged, BUT it shifts the face box the MiniFASNet liveness models
-    # crop from — and those models are crop-sensitive, so it can flip is_live
-    # decisions. Do not lower without re-validating liveness on real selfies.
-    face_detection_width: int = 640
-    face_detection_height: int = 640
+    # Detector input size. 512x512 detects large selfie faces and (via the
+    # low-thresh + upscale cascade) small document faces reliably, at lower
+    # latency than 640. Match scores are effectively unchanged (measured 0.750
+    # @640 vs 0.743 @512). Safe now that the liveness gate is off — nothing
+    # crops off this box anymore. Raise to 640 only if small faces are missed.
+    face_detection_width: int = 512
+    face_detection_height: int = 512
     face_area_threshold: float = 0.01
     face_enable_padding_retry: bool = True
     face_padding_fraction: float = 0.25
@@ -114,10 +114,12 @@ class MLServiceSettings(BaseSettings):
     face_enable_upscale_retry: bool = True
     face_upscale_factor: float = 2.0
     # Average each face embedding with its horizontal-mirror embedding (flip TTA).
-    # Standard ArcFace trick; measurably improves robustness on low-quality/blurry
-    # inputs (printed document photos) with no impostor-score cost. One extra
-    # recognition pass per embed.
-    face_enable_flip_tta: bool = True
+    # Standard ArcFace trick; slightly improves robustness on low-quality inputs,
+    # but doubles the recognition pass per embed. OFF by default for throughput:
+    # it ~halves embed latency (measured 278ms->106ms for two embeds) for only a
+    # ~0.02-0.03 genuine-score drop, well clear of the 0.5 threshold. Set True to
+    # trade speed back for a little robustness on blurry document photos.
+    face_enable_flip_tta: bool = False
 
 
 @lru_cache

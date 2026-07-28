@@ -134,8 +134,8 @@ def test_match_when_vectors_identical() -> None:
     body = r.json()
     assert body["verificationResult"]["isMatch"] is True
     assert body["verificationResult"]["score"] == pytest.approx(1.0)
-    assert body["iqaPassed"] is True                       # base64 selfie = online
-    assert body["imageQualityAssessment"] is not None      # IQA always runs
+    assert body["iqaPassed"] is True
+    assert body["imageQualityAssessment"] is None          # facematch runs no liveness/IQA
 
 
 def test_docmatch_document_vs_source_selfie() -> None:
@@ -156,7 +156,8 @@ def test_docmatch_document_vs_source_selfie() -> None:
 
 
 def test_facematch_returns_score_block() -> None:
-    """The response exposes a flat scores block: match + liveness/blur/nsfw + margin."""
+    """The response exposes a flat scores block: match + margin. Liveness/blur/nsfw
+    are null because facematch runs no IQA/liveness gate (pure 1:1 match)."""
     vec = [1.0, 0.0, 0.0]
     client = _client(_IQA(), _Embedding(live_vec=vec, ref_vec=vec), _Fetcher(_jpeg_bytes()))
     body = _post(client).json()
@@ -164,9 +165,9 @@ def test_facematch_returns_score_block() -> None:
     assert scores["matchScore"] == pytest.approx(1.0)
     assert scores["threshold"] == pytest.approx(0.5)
     assert scores["margin"] == pytest.approx(0.5)
-    assert scores["livenessScore"] == pytest.approx(0.99)  # _IQA spoof probability
-    assert scores["blurScore"] == pytest.approx(0.95)
-    assert scores["nsfwSafeScore"] == pytest.approx(0.01)
+    assert scores["livenessScore"] is None
+    assert scores["blurScore"] is None
+    assert scores["nsfwSafeScore"] is None
     assert body["verificationResult"]["thresholdSource"] == "default"
 
 
@@ -198,17 +199,19 @@ def test_threshold_source_reports_learned() -> None:
     assert r.json()["verificationResult"]["thresholdSource"] == "learned"
 
 
-def test_recorded_sample_includes_quality_scores() -> None:
-    """facematch logs the liveness/quality scores alongside the match score for learning."""
+def test_recorded_sample_has_no_quality_scores() -> None:
+    """facematch logs the match score for learning; quality scores are null since
+    no IQA/liveness gate runs (pure 1:1 match)."""
     vec = [1.0, 0.0, 0.0]
     learner = _Learner()
     client = _client(_IQA(), _Embedding(live_vec=vec, ref_vec=vec), _Fetcher(_jpeg_bytes()), learner)
     _post(client)
     assert len(learner.samples) == 1
     sample = learner.samples[0]
-    assert sample["liveness_score"] == pytest.approx(0.99)
-    assert sample["blur_score"] == pytest.approx(0.95)
-    assert sample["nsfw_safe_score"] == pytest.approx(0.01)
+    assert sample["score"] == pytest.approx(1.0)
+    assert sample["liveness_score"] is None
+    assert sample["blur_score"] is None
+    assert sample["nsfw_safe_score"] is None
 
 
 def test_docmatch_reports_document_face_diagnostics() -> None:
@@ -339,10 +342,10 @@ def test_scored_verification_is_recorded_for_learning() -> None:
 
 
 def test_unscored_verification_is_not_recorded() -> None:
-    """Liveness failures carry no match score, so nothing is logged for learning."""
+    """No face in the probe carries no match score, so nothing is logged for learning."""
     learner = _Learner()
     client = _client(
-        _IQA(live=False), _Embedding(live_vec=[1.0], ref_vec=[1.0]), _Fetcher(_jpeg_bytes()), learner
+        _IQA(), _Embedding(live_vec=None, ref_vec=[1.0], face=False), _Fetcher(_jpeg_bytes()), learner
     )
     _post(client)
     assert learner.samples == []
@@ -388,7 +391,7 @@ def test_invalid_base64_selfie_rejected() -> None:
 
 
 def test_facematch_probe_and_source_from_s3() -> None:
-    """Both sides can be S3 URLs; facematch still gates the probe (face_check) on liveness."""
+    """Both sides can be S3 URLs; facematch is a pure 1:1 match (no liveness gate)."""
     vec = [1.0, 0.0, 0.0]
     client = _client(_IQA(), _Embedding(live_vec=vec, ref_vec=vec), _Fetcher(_jpeg_bytes()))
     r = client.post(
@@ -399,7 +402,7 @@ def test_facematch_probe_and_source_from_s3() -> None:
     body = r.json()
     assert body["verificationResult"]["isMatch"] is True
     assert body["iqaPassed"] is True
-    assert body["imageQualityAssessment"] is not None  # liveness ran on the probe
+    assert body["imageQualityAssessment"] is None  # no liveness gate
 
 
 def test_source_selfie_from_b64_matches() -> None:
@@ -470,6 +473,18 @@ def test_error_when_both_reference_sources_provided() -> None:
     assert r.status_code == 400
 
 
+def test_facematch_is_pure_match_no_liveness() -> None:
+    """facematch is a pure 1:1 match: no IQA/liveness gate runs, so a
+    spoof-flagged probe still verifies on match score alone."""
+    vec = [1.0, 0.0, 0.0]
+    client = _client(_IQA(live=False), _Embedding(live_vec=vec, ref_vec=vec), _Fetcher(_jpeg_bytes()))
+    body = _post(client).json()
+    assert body["verificationResult"]["isMatch"] is True     # matched on score alone
+    assert body["imageQualityAssessment"] is None            # liveness gate did not run
+    assert "livenessFailed" not in body                      # spoof flag ignored
+    assert body["scores"]["livenessScore"] is None
+
+
 def test_no_match_when_vectors_orthogonal() -> None:
     client = _client(
         _IQA(),
@@ -477,18 +492,6 @@ def test_no_match_when_vectors_orthogonal() -> None:
         _Fetcher(_jpeg_bytes()),
     )
     body = _post(client).json()
-    assert body["verificationResult"]["isMatch"] is False
-
-
-def test_liveness_failure_short_circuits() -> None:
-    client = _client(
-        _IQA(live=False),
-        _Embedding(live_vec=[1.0], ref_vec=[1.0]),
-        _Fetcher(_jpeg_bytes()),
-    )
-    body = _post(client).json()
-    assert body["iqaPassed"] is False
-    assert body["livenessFailed"] is True
     assert body["verificationResult"]["isMatch"] is False
 
 

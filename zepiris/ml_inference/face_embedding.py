@@ -33,7 +33,7 @@ class FaceEmbeddingService(ModelService):
     def __init__(
         self,
         embedding_dim: int = 512,
-        detection_size: tuple[int, int] = (640, 640),
+        detection_size: tuple[int, int] = (512, 512),
         facial_area_threshold: float = 0.01,
         device: str = "cpu",
         enable_padding_retry: bool = True,
@@ -45,7 +45,7 @@ class FaceEmbeddingService(ModelService):
         enable_upscale_retry: bool = True,
         upscale_factor: float = 2.0,
         upscale_max_side: int = 2000,
-        enable_flip_tta: bool = True,
+        enable_flip_tta: bool = False,
     ) -> None:
         """Initialize face embedding service.
 

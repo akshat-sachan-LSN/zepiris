@@ -342,7 +342,7 @@ async def facematch_verify(
         embedding_svc=embedding_svc,
         decision_threshold=decision_threshold,
         threshold_source=threshold_source,
-        run_liveness=True,
+        run_liveness=False,
     )
     _record_outcome(learner, request_id=request_id, doc_type=FACE_KIND, body=body)
     return body
