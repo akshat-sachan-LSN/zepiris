@@ -36,17 +36,30 @@ Throughput anchor for sizing: **~3–4 req/s per 4 vCPU**.
 
 ---
 
-## 2. Workload
+## 2. Workload (real traffic, 28-Jul)
+
+**Hourly volume** — busy hours run 8k–12k events/hr (~140–207 req/min avg):
+
+![Go-online events per hour](docs/traffic-hourly.png)
+
+**Peak minute** — the busiest single minute is what actually sizes the fleet.
+Shift-start bursts spike far above the hourly average:
+
+![Peak minute per hour](docs/traffic-peak-minute.png)
 
 | | Value |
 |---|---|
-| Baseline | ~10 req/min (~0.17 req/s) |
-| Daily spikes | 05:00, 09:00, 17:00, 20:00 IST — rider go-online |
-| Spike size | up to ~1000 req/min (~17 req/s) |
-| Spike duration | ~15 min each |
+| **Peak minute (size for this)** | **~1,440 req/min ≈ 24 req/s** (06:00 shift-start burst) |
+| Secondary peaks | 08:00 ≈ 937/min · 18:00 ≈ 865/min · 16:00 ≈ 803/min |
+| Busy-hour average | ~12,400/hr ≈ 207/min ≈ 3.5 req/s |
+| High-traffic bands | **morning 06:00–08:00** and **afternoon/evening 14:00–18:00** IST |
+| Off-peak baseline | ~2k/hr ≈ 30–60/min ≈ ~1 req/s |
 
-Spiky, at fixed clock times → **scheduled autoscaling** (pre-warm before each
-spike), with reactive target-tracking as a safety net.
+Note the burst shape: hour 06 averages ~143/min but its **peak minute hits 1,439**
+(~10× the hourly average) — a sharp spike exactly at shift-start. Reactive
+autoscaling can't spin up a model task inside a 1-minute burst (model load
+~15–20 s), so the fleet must be **pre-warmed before 06:00 and before 14:00** via
+scheduled scaling, with target-tracking as a safety net.
 
 ---
 
@@ -59,22 +72,24 @@ spike), with reactive target-tracking as a safety net.
 
 ### Option A — ECS Fargate (recommended)
 
-| Service | Task size | Baseline | Spike (15 min) | Throughput |
+| Service | Task size | Off-peak | Peak band | Throughput |
 |---|---|---|---|---|
-| **ml_inference** | **4 vCPU / 8 GB** | 1 task | **6 tasks** | ~3–4 req/s / task |
-| **API** | **0.5 vCPU / 1 GB** | 1 task | 2 tasks | I/O only |
+| **ml_inference** | **4 vCPU / 8 GB** | 1–2 tasks | **8 tasks** | ~3–4 req/s / task |
+| **API** | **0.5 vCPU / 1 GB** | 1 task | 3 tasks | I/O only |
 | ALB | — | 1 | 1 | — |
 
-Models need ~1–2 GB resident — keep memory ≥ 8 GB/task. 6 ml tasks ≈ 21 req/s > 17 req/s peak (headroom).
-At this volume API + ml_inference may be **collapsed into one 4 vCPU / 8 GB task** for simplicity.
+Sizing to the **peak minute (~24 req/s)**: 8 ml tasks × ~3.5 req/s ≈ **28 req/s > 24** (headroom for the 06:00 burst). Models need ~1–2 GB resident — keep memory ≥ 8 GB/task.
+Off-peak (~1 req/s) → 1 task; busy-hour average (~3.5 req/s) is covered by 1–2 tasks, but the fleet is held at 8 through each peak band to absorb minute-bursts.
 
 ### Option B — EC2 (ECS-on-EC2 or plain ASG)
 
-| Role | Instance | Baseline | Spike |
+| Role | Instance | Off-peak | Peak band |
 |---|---|---|---|
-| ml_inference | `c7i.2xlarge` (8 vCPU / 16 GB, ~7 req/s) | 1 | 3 |
-| — finer unit — | `c7i.xlarge` (4 vCPU / 8 GB, ~3.5 req/s) | 1 | 6 |
+| ml_inference | `c7i.2xlarge` (8 vCPU / 16 GB, ~7 req/s) | 1 | **4** |
+| — finer unit — | `c7i.xlarge` (4 vCPU / 8 GB, ~3.5 req/s) | 1 | 8 |
 | API | `c7i.large` (2 vCPU / 4 GB) | 1 | 2 |
+
+4× `c7i.2xlarge` ≈ 28 req/s > 24 req/s peak.
 
 **Graviton alt:** `c7g.*` (ARM) — arm64 wheels work, ~15–20% cheaper. Use `c7i` (x86) for the most-tested wheel path.
 
@@ -82,37 +97,47 @@ At this volume API + ml_inference may be **collapsed into one 4 vCPU / 8 GB task
 
 ## 4. Autoscaling (scheduled + reactive)
 
-| Trigger | Action | Why |
-|---|---|---|
-| **Scheduled** 04:50 / 08:50 / 16:50 / 19:50 IST | ml_inference min 1 → **6** | Pre-warm ~10 min before spike (model load ~15–20 s; reacting at spike-start misses the window) |
-| **Scheduled** +20 min (05:10 / 09:10 / 17:10 / 20:10) | scale **6 → 1** | Back to baseline |
-| **Target tracking** (backup) | ALB `RequestCountPerTarget` or CPU 60% → add tasks | Unexpected/early bursts |
+Two high-traffic bands per day; pre-warm before each, hold through, scale down after.
 
-- Cooldowns: scale-out 60 s (fast), scale-in 300 s (slow) — avoids flapping mid-spike.
-- **min ≥ 1** always (or 2 for AZ HA) — **never scale to zero**, cold model load would blow the first requests.
-- Run **spike tasks on Fargate Spot** (~70% cheaper; the bursts are interruption-tolerant); keep baseline on on-demand.
+| Trigger (IST) | UTC cron | Action | Why |
+|---|---|---|---|
+| **05:50** (before 06:00 burst) | `cron(20 0 * * ? *)` | ml_inference → **8** | Pre-warm for the 1,439/min morning burst |
+| **08:30** | `cron(0 3 * * ? *)` | scale **8 → 2** | Morning band over |
+| **13:50** (before evening band) | `cron(20 8 * * ? *)` | → **8** | Pre-warm for 14:00–18:00 |
+| **18:45** | `cron(15 13 * * ? *)` | scale **8 → 1** | Evening band over |
+| **Target tracking** (backup) | — | ALB `RequestCountPerTarget` ≈ 200/target/min, or CPU 60% → add tasks | Absorbs off-schedule bursts |
 
-Example (Application Auto Scaling, one per window):
+- Cooldowns: scale-out 60 s (fast), scale-in 300 s (slow) — no flapping mid-band.
+- **min ≥ 1** always (2 for AZ HA) — **never scale to zero**; cold model load (~15–20 s) would drop the first requests.
+- Run peak-band tasks on **Fargate Spot** (~70% cheaper; bursts are interruption-tolerant); keep the 1–2 baseline tasks on-demand.
+
+Example — morning pre-warm (Application Auto Scaling):
 ```bash
 aws application-autoscaling put-scheduled-action --service-namespace ecs \
   --resource-id service/zepiris/ml-inference \
   --scalable-dimension ecs:service:DesiredCount \
-  --scheduled-action-name prewarm-0450 \
-  --schedule "cron(20 23 * * ? *)"   `# 04:50 IST = 23:20 UTC` \
-  --scalable-target-action MinCapacity=6,MaxCapacity=8
-# +20 min: scale back to MinCapacity=1,MaxCapacity=2
+  --scheduled-action-name prewarm-morning \
+  --schedule "cron(20 0 * * ? *)"   `# 05:50 IST = 00:20 UTC` \
+  --scalable-target-action MinCapacity=8,MaxCapacity=8
+# 08:30 scale-in:  cron(0 3 * * ? *)   -> MinCapacity=2,MaxCapacity=8
+# 13:50 pre-warm:  cron(20 8 * * ? *)  -> MinCapacity=8,MaxCapacity=8
+# 18:45 scale-in:  cron(15 13 * * ? *) -> MinCapacity=1,MaxCapacity=8
 ```
 
 ---
 
 ## 5. Cost (ap-south-1, on-demand, approx)
 
-| | Baseline 24/7 | + 4 daily 15-min spikes |
-|---|---|---|
-| Fargate (1× 4vCPU/8GB + 1× 0.5vCPU) | **~$160/mo** | +~$5/mo |
-| EC2 (1× c7i.2xlarge + 1× c7i.large) | **~$400/mo** | +~$8/mo |
+Peak bands run ~7.5 h/day total (morning ~2.5 h + evening ~5 h) at 8 tasks; off-peak 1–2 tasks the rest of the time.
 
-Fargate wins here — you pay for 1 baseline task 24/7; the 6-task spike runs ~1 hr/day total. A GPU (`g5.xlarge`) would be idle 99% of the time — skip it.
+| | Cost |
+|---|---|
+| Baseline (1–2× 4vCPU/8GB on-demand, 24/7) | ~$160–320/mo |
+| Peak bands (extra ~6 tasks × ~7.5 h/day on **Spot**) | ~$100/mo |
+| **Total (Fargate)** | **~$260–420/mo** |
+| EC2 equivalent (c7i on-demand + Spot for peak) | ~$450–600/mo |
+
+Fargate + Spot for the peak bands is the sweet spot. A GPU (`g5.xlarge`, ~$900/mo) would sit idle ~90% of the day for a 24 req/s peak — **skip it** until you're at hundreds of req/s.
 
 ---
 
