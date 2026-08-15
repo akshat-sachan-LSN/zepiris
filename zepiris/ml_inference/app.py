@@ -10,14 +10,17 @@ Or via the entry point:
 from __future__ import annotations
 
 import logging
+import time
 from contextlib import asynccontextmanager
 from functools import lru_cache
 from pathlib import Path
 
+import anyio.to_thread
 from fastapi import FastAPI
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from zepiris.ml_inference.blur_detection import BlurDetectionService
+from zepiris.ml_inference.concurrency import InferenceLimiter
 from zepiris.ml_inference.face_embedding import FaceEmbeddingService
 from zepiris.ml_inference.image_quality_assessment import (
     ImageQualityAssessmentService,
@@ -113,6 +116,42 @@ class MLServiceSettings(BaseSettings):
     # Retry detection on an upscaled copy when no face is found (helps tiny doc faces).
     face_enable_upscale_retry: bool = True
     face_upscale_factor: float = 2.0
+    # -- throughput ----------------------------------------------------------
+    # Detector/recognizer pairing. "balanced" (default) keeps buffalo_l's
+    # ResNet50 recognition — the model that decides match scores — behind
+    # buffalo_s's much cheaper SCRFD-500M detector, roughly doubling throughput.
+    # "accurate" is stock buffalo_l. "fast" also swaps recognition for
+    # MobileFaceNet (~9x throughput) but moves the embedding space, so its
+    # threshold must be recalibrated first — see scripts/compare_tiers.py.
+    face_tier: str = "balanced"
+    # ONNX Runtime threads *inside* one inference. 1 means each request is served
+    # by one core and parallelism comes from serving many requests at once, which
+    # is what scales: at 100 in-flight requests, per-inference fan-out
+    # oversubscribes the CPU and collapses throughput. Raise only for low-
+    # concurrency deployments where single-request latency is the goal.
+    face_intra_op_threads: int = 1
+    face_inter_op_threads: int = 1
+    # Downscale inputs whose longer side exceeds this before detection (0 = off).
+    # The detector letterboxes to face_detection_* anyway, so a 12 MP capture only
+    # makes that resize costlier; the recognition crop is unaffected.
+    face_max_input_side: int = 1600
+    # Memoize detector output by image content. Only pays off when one request
+    # detects the same pixels twice (it did while the liveness gate ran first).
+    face_enable_det_cache: bool = False
+    # Cap concurrent inferences. Past the core count, extra in-flight work adds
+    # queueing latency but no throughput, so requests beyond this wait briefly and
+    # are then shed with 503 rather than piling up past the client's timeout.
+    # 0 = derive from the CPU count.
+    max_concurrent_inferences: int = 0
+    # How long a request waits for an inference slot before being shed (503).
+    inference_queue_timeout_seconds: float = 20.0
+    # Run throwaway inferences at startup so the first real request does not pay
+    # the cold-session cost. Matters most under autoscaling, where a new instance
+    # goes straight into the burst it was scaled out for. /readyz stays 503 until
+    # this finishes, so the load balancer holds traffic back until then.
+    warmup_on_startup: bool = True
+    warmup_iterations: int = 2
+
     # Average each face embedding with its horizontal-mirror embedding (flip TTA).
     # Standard ArcFace trick; slightly improves robustness on low-quality inputs,
     # but doubles the recognition pass per embed. OFF by default for throughput:
@@ -127,6 +166,37 @@ def get_ml_settings() -> MLServiceSettings:
     return MLServiceSettings()
 
 
+async def _warm_up(service, iterations: int) -> None:
+    """Run throwaway inferences so the first real request is not the slow one.
+
+    A cold ONNX session pays one-off costs on its first run — memory arena
+    allocation, kernel selection, first touch of the weights. Under autoscaling
+    that lands on real traffic: the instance reports healthy, receives the burst
+    it was scaled out for, and answers the first requests several times slower
+    than it will answer the rest. Paying it here, before ``/readyz`` passes,
+    moves that cost off the request path entirely.
+
+    Uses synthetic noise rather than a face image: the point is to execute the
+    graph, and detection finding nothing still runs the full detector.
+    """
+    import numpy as np
+
+    def _run() -> None:
+        rng = np.random.default_rng(0)
+        frame = rng.integers(0, 255, (640, 480, 3), dtype=np.uint8)
+        for _ in range(max(1, iterations)):
+            service.match_pair(frame, frame)
+
+    started = time.perf_counter()
+    try:
+        await anyio.to_thread.run_sync(_run)
+        logger.info("Warm-up complete in %.2fs", time.perf_counter() - started)
+    except Exception:
+        # A warm-up failure says nothing about whether real traffic will work —
+        # the models loaded. Log it and let readiness proceed.
+        logger.warning("Warm-up failed; serving anyway", exc_info=True)
+
+
 # ---------------------------------------------------------------------------
 # Lifespan — instantiate every model service once on startup
 # ---------------------------------------------------------------------------
@@ -134,6 +204,23 @@ def get_ml_settings() -> MLServiceSettings:
 async def lifespan(app: FastAPI):
     s = get_ml_settings()
     device = s.ml_device
+
+    # Admission control first, so the app can shed load even if a model fails.
+    app.state.inference_limiter = InferenceLimiter.from_settings(
+        s.max_concurrent_inferences, s.inference_queue_timeout_seconds
+    )
+    # Starlette runs sync routes on a 40-slot thread pool by default. Inference
+    # is already capped by the limiter above; the pool just needs enough threads
+    # to service that cap plus the non-inference routes, or requests would queue
+    # twice — once for a thread, then again for a slot.
+    limiter = anyio.to_thread.current_default_thread_limiter()
+    limiter.total_tokens = max(40, app.state.inference_limiter.limit * 2 + 8)
+    logger.info(
+        "Concurrency: max_concurrent_inferences=%d queue_timeout=%.1fs thread_pool=%d",
+        app.state.inference_limiter.limit,
+        s.inference_queue_timeout_seconds,
+        int(limiter.total_tokens),
+    )
 
     logger.info("Loading ML models on device=%s …", device)
     failed: list[str] = []
@@ -174,6 +261,11 @@ async def lifespan(app: FastAPI):
             enable_upscale_retry=s.face_enable_upscale_retry,
             upscale_factor=s.face_upscale_factor,
             enable_flip_tta=s.face_enable_flip_tta,
+            tier=s.face_tier,
+            intra_op_threads=s.face_intra_op_threads,
+            inter_op_threads=s.face_inter_op_threads,
+            max_input_side=s.face_max_input_side,
+            enable_det_cache=s.face_enable_det_cache,
         )
         app.state.face_embedding_service.load_model()
     except Exception:
@@ -268,10 +360,16 @@ async def lifespan(app: FastAPI):
             spoof_service=spoof,
             blur_service=blur,
         )
+    elif s.face_match_only:
+        # Face-match-only deliberately does not load the IQA models; this is the
+        # configured state, not a fault, and must not page anyone.
+        app.state.iqa_service = None
+        logger.info("IQA disabled: face_match_only=true (only face embedding is loaded)")
     else:
         app.state.iqa_service = None
         logger.error(
-            "IQA disabled: need all three models loaded (nsfw=%s spoof=%s blur=%s)",
+            "IQA disabled: need all three models loaded (nsfw_missing=%s spoof_missing=%s "
+            "blur_missing=%s)",
             nsfw is None,
             spoof is None,
             blur is None,
@@ -281,6 +379,14 @@ async def lifespan(app: FastAPI):
         logger.warning("ML service started with degraded models: %s", ", ".join(failed))
     else:
         logger.info("All ML models loaded successfully.")
+
+    app.state.warmed_up = False
+    if s.warmup_on_startup and app.state.face_embedding_service is not None:
+        await _warm_up(app.state.face_embedding_service, s.warmup_iterations)
+        app.state.warmed_up = True
+    else:
+        app.state.warmed_up = app.state.face_embedding_service is not None
+
     yield
     logger.info("ML inference service shutting down.")
 
@@ -289,8 +395,10 @@ async def lifespan(app: FastAPI):
 # App factory
 # ---------------------------------------------------------------------------
 def create_app() -> FastAPI:
+    from zepiris.logging_config import configure_logging
     from zepiris.ml_inference.routes import router
 
+    configure_logging()
     application = FastAPI(
         title="ZepIris ML Inference Service",
         version=package_version,

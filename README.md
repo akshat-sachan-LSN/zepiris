@@ -804,6 +804,8 @@ poetry add torch torchvision --platform linux --python "^3.10"
 - **[LOCAL_SETUP_AND_TEST.md](docs/LOCAL_SETUP_AND_TEST.md)** — Step-by-step local testing guide (20-30 min)
 - **[docs/API_REFERENCE.md](docs/API_REFERENCE.md)** — Complete API endpoint reference
 - **[docs/CONFIGURATION.md](docs/CONFIGURATION.md)** — Environment variables & tuning
+- **[docs/PERFORMANCE.md](docs/PERFORMANCE.md)** — Throughput, model tiers, and capacity sizing
+- **[docs/EC2_AUTOSCALING.md](docs/EC2_AUTOSCALING.md)** — EC2 autoscaling deployment plan
 - **[CONTRIBUTING.md](CONTRIBUTING.md)** — Code guidelines & contribution workflow
 - **[.env.example](.env.example)** — Complete environment variable template
 

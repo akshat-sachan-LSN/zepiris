@@ -7,7 +7,14 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from zepiris.api.routes import face as face_routes
-from zepiris.deps import EmbeddingDep, IQADep, LearnerDep, S3FetcherDep, SettingsDep
+from zepiris.deps import (
+    EmbeddingDep,
+    IQADep,
+    LearnerDep,
+    MatcherDep,
+    S3FetcherDep,
+    SettingsDep,
+)
 from zepiris.exception_handlers import register_exception_handlers
 from zepiris.schemas.ml_inference import (
     BlurDetectionResult,
@@ -17,6 +24,7 @@ from zepiris.schemas.ml_inference import (
     NSFWDetectionResult,
     SpoofDetectionResult,
 )
+from zepiris.services.matching import LocalFaceMatcher
 
 
 def _jpeg_bytes() -> bytes:
@@ -79,7 +87,7 @@ class _Fetcher:
     def __init__(self, data: bytes) -> None:
         self._data = data
 
-    def fetch(self, url: str) -> bytes:
+    async def fetch(self, url: str) -> bytes:
         return self._data
 
 
@@ -109,6 +117,11 @@ def _client(iqa, embedding, fetcher, learner=None) -> TestClient:
     app.dependency_overrides[SettingsDep.__metadata__[0].dependency] = lambda: _Settings()
     app.dependency_overrides[IQADep.__metadata__[0].dependency] = lambda: iqa
     app.dependency_overrides[EmbeddingDep.__metadata__[0].dependency] = lambda: embedding
+    # The routes score through a matcher; LocalFaceMatcher is the in-process one,
+    # so the stub embedding provider still drives the assertions below.
+    app.dependency_overrides[MatcherDep.__metadata__[0].dependency] = lambda: LocalFaceMatcher(
+        embedding
+    )
     app.dependency_overrides[S3FetcherDep.__metadata__[0].dependency] = lambda: fetcher
     app.dependency_overrides[LearnerDep.__metadata__[0].dependency] = lambda: learner or _Learner()
     return TestClient(app)
@@ -248,6 +261,11 @@ def test_docmatch_rejects_too_blurry_document_when_gate_enabled() -> None:
     app.dependency_overrides[SettingsDep.__metadata__[0].dependency] = lambda: _StrictSettings()
     app.dependency_overrides[IQADep.__metadata__[0].dependency] = lambda: _IQA()
     app.dependency_overrides[EmbeddingDep.__metadata__[0].dependency] = lambda: embedding
+    # The routes score through a matcher; LocalFaceMatcher is the in-process one,
+    # so the stub embedding provider still drives the assertions below.
+    app.dependency_overrides[MatcherDep.__metadata__[0].dependency] = lambda: LocalFaceMatcher(
+        embedding
+    )
     app.dependency_overrides[S3FetcherDep.__metadata__[0].dependency] = lambda: _Fetcher(
         _jpeg_bytes()
     )

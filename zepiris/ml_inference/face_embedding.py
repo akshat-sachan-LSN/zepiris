@@ -16,7 +16,12 @@ from insightface.app.common import Face
 from insightface.utils import face_align
 
 from zepiris.ml_inference.base import ModelService, ModelServiceConfig
-from zepiris.schemas.ml_inference import FaceDetectionResult, FaceEmbeddingResult
+from zepiris.ml_inference.face_engine import DEFAULT_TIER, EngineConfig, build_engine
+from zepiris.schemas.ml_inference import (
+    FaceDetectionResult,
+    FaceEmbeddingResult,
+    FaceMatchResult,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +51,11 @@ class FaceEmbeddingService(ModelService):
         upscale_factor: float = 2.0,
         upscale_max_side: int = 2000,
         enable_flip_tta: bool = False,
+        tier: str = DEFAULT_TIER,
+        intra_op_threads: int = 1,
+        inter_op_threads: int = 1,
+        max_input_side: int = 0,
+        enable_det_cache: bool = False,
     ) -> None:
         """Initialize face embedding service.
 
@@ -85,6 +95,26 @@ class FaceEmbeddingService(ModelService):
                 ArcFace trick that measurably improves robustness on low-quality /
                 blurry inputs (e.g. printed document photos) at the cost of one extra
                 recognition pass; impostor scores are unaffected.
+            tier: Detector/recognizer pairing — see
+                :mod:`zepiris.ml_inference.face_engine`. ``"accurate"`` reproduces
+                stock buffalo_l; ``"balanced"`` keeps the same recognition weights
+                behind a much cheaper detector; ``"fast"`` also swaps in
+                MobileFaceNet recognition (needs threshold recalibration).
+            intra_op_threads: ONNX Runtime threads within a single inference. 1 —
+                the default — serves each request on one core and takes
+                parallelism from request concurrency instead, which is what
+                scales. See :class:`~zepiris.ml_inference.face_engine.EngineConfig`.
+            inter_op_threads: ONNX Runtime threads across graph branches.
+            max_input_side: Downscale inputs whose longer side exceeds this before
+                detection (0 = never). The detector resizes to ``detection_size``
+                internally regardless, so feeding it a 12 MP phone capture only
+                pays for a bigger resize; the recognition crop is unaffected at
+                any sane cap. 1600 is a safe production value.
+            enable_det_cache: Memoize detector output keyed by image content. Only
+                pays off when the same pixels are detected twice in one request,
+                which was true when the liveness gate ran before the embed. With
+                liveness off there is no second pass, so the cache is off by
+                default — hashing a multi-megapixel frame costs more than it saves.
         """
         self._embedding_dim = embedding_dim
         self._detection_size = detection_size
@@ -99,14 +129,24 @@ class FaceEmbeddingService(ModelService):
         self._upscale_factor = upscale_factor
         self._upscale_max_side = upscale_max_side
         self._enable_flip_tta = enable_flip_tta
+        self._tier = tier
+        self._intra_op_threads = intra_op_threads
+        self._inter_op_threads = inter_op_threads
+        self._max_input_side = max_input_side
         self._face_app: FaceAnalysis | None = None
+        self._load_lock = threading.Lock()
+        # The detector's confidence threshold is instance state on the shared
+        # det_model, so a per-call override has to be set and restored around the
+        # call. Serialize that window: concurrent requests would otherwise
+        # interleave set/restore and detect at each other's thresholds.
+        self._det_thresh_lock = threading.Lock()
         # Short-lived memo of the detector's raw output, keyed by image content +
-        # threshold. A facematch sends the same probe image to the liveness path
-        # (which detects to crop for MiniFASNet) and then to the embed path
-        # (which detects again) — two HTTP calls, same pixels. detect() is a pure
-        # function of (image, det_thresh, det_size), so caching its result lets
-        # the second call skip a full detection with no behavioural change.
+        # threshold. Worth it only when one request detects the same pixels twice,
+        # which was the case while the liveness gate cropped the probe before the
+        # embed ran. That gate is off, so this defaults to disabled: hashing a
+        # multi-megapixel frame costs more than the detection it would save.
         # Bounded LRU; nothing is persisted beyond the last few requests.
+        self._enable_det_cache = enable_det_cache
         self._det_cache: OrderedDict[bytes, tuple] = OrderedDict()
         self._det_cache_lock = threading.Lock()
         self._det_cache_max = 16
@@ -116,15 +156,49 @@ class FaceEmbeddingService(ModelService):
         )
         super().__init__(config)
 
-    def load_model(self) -> FaceAnalysis:
-        """Initialize InsightFace FaceAnalysis with buffalo_l model.
+    def load_model(self):
+        """Build (once) the detector + recognizer pair this service runs on.
+
+        Prefers :func:`~zepiris.ml_inference.face_engine.build_engine`, which
+        pins the ONNX Runtime thread pools and can pair a cheap detector with
+        the accurate recognizer. Falls back to stock ``FaceAnalysis`` if that
+        fails for any reason, so a bad tier or a missing pack degrades to the
+        previous behaviour instead of taking the service down.
 
         Returns:
-            FaceAnalysis: Prepared model with detection + recognition only
+            An object exposing ``.det_model`` and ``.models["recognition"]``.
         """
         if self._face_app is not None:
             return self._face_app
 
+        with self._load_lock:
+            if self._face_app is not None:
+                return self._face_app
+            try:
+                self._face_app = build_engine(
+                    EngineConfig(
+                        tier=self._tier,
+                        det_size=self._detection_size,
+                        det_thresh=self._det_thresh,
+                        intra_op_threads=self._intra_op_threads,
+                        inter_op_threads=self._inter_op_threads,
+                        device=self.config.device,
+                    )
+                )
+                return self._face_app
+            except Exception:
+                logger.warning(
+                    "Tuned face engine (tier=%r) failed to build; falling back to "
+                    "stock FaceAnalysis(%r)",
+                    self._tier,
+                    self._model_name,
+                    exc_info=True,
+                )
+            self._face_app = self._load_face_analysis()
+            return self._face_app
+
+    def _load_face_analysis(self) -> FaceAnalysis:
+        """Stock InsightFace loading path (fallback)."""
         ctx_id = 0 if self.config.device != "cpu" else -1
 
         def _prepare(name: str) -> FaceAnalysis:
@@ -158,8 +232,7 @@ class FaceEmbeddingService(ModelService):
                 )
                 app = _prepare("buffalo_l")
 
-        self._face_app = app
-        return self._face_app
+        return app
 
     @staticmethod
     def _clear_model_cache(name: str) -> None:
@@ -178,14 +251,38 @@ class FaceEmbeddingService(ModelService):
         except OSError:
             pass
 
+    def _run_detect(self, app, image_rgb: np.ndarray, det_thresh: float | None) -> tuple:
+        """Invoke the detector, honouring a one-call threshold override.
+
+        The override is applied by mutating ``det_model.det_thresh`` around the
+        call — InsightFace exposes no per-call threshold — so it is serialized
+        under a lock. Without it, two concurrent requests can interleave the
+        set/restore and one of them silently detects at the other's threshold.
+        """
+        det_model = app.det_model
+        if det_thresh is None or not hasattr(det_model, "det_thresh"):
+            return det_model.detect(image_rgb, max_num=0, metric="default")
+        with self._det_thresh_lock:
+            prev = det_model.det_thresh
+            det_model.det_thresh = det_thresh
+            try:
+                return det_model.detect(image_rgb, max_num=0, metric="default")
+            finally:
+                det_model.det_thresh = prev
+
     def _detect(self, image_rgb: np.ndarray, det_thresh: float | None) -> tuple:
-        """Run the detector, memoizing its output per (image content, threshold).
+        """Run the detector, optionally memoizing per (image content, threshold).
 
         ``app.det_model.detect`` is deterministic in (image, det_thresh, det_size),
-        so the same probe image hitting the liveness path and then the embed path
-        reuses one detection instead of running two. Returns ``(bboxes, kpss)``.
+        so when one request detects the same pixels more than once the memo saves
+        a full pass. It is off by default — see ``enable_det_cache``; hashing a
+        multi-megapixel frame costs more than it saves on the single-pass path.
+        Returns ``(bboxes, kpss)``.
         """
         app = self.load_model()
+        if not self._enable_det_cache:
+            return self._run_detect(app, image_rgb, det_thresh)
+
         eff_thresh = det_thresh if det_thresh is not None else getattr(app.det_model, "det_thresh", None)
         digest = hashlib.blake2b(np.ascontiguousarray(image_rgb), digest_size=16).digest()
         key = b"%s|%r|%r" % (digest, eff_thresh, image_rgb.shape)
@@ -196,15 +293,7 @@ class FaceEmbeddingService(ModelService):
                 self._det_cache.move_to_end(key)
                 return cached
 
-        if det_thresh is not None and hasattr(app.det_model, "det_thresh"):
-            prev = app.det_model.det_thresh
-            app.det_model.det_thresh = det_thresh
-            try:
-                result = app.det_model.detect(image_rgb, max_num=0, metric="default")
-            finally:
-                app.det_model.det_thresh = prev
-        else:
-            result = app.det_model.detect(image_rgb, max_num=0, metric="default")
+        result = self._run_detect(app, image_rgb, det_thresh)
 
         with self._det_cache_lock:
             self._det_cache[key] = result
@@ -212,6 +301,28 @@ class FaceEmbeddingService(ModelService):
             while len(self._det_cache) > self._det_cache_max:
                 self._det_cache.popitem(last=False)
         return result
+
+    def _cap_input(self, image_rgb: np.ndarray) -> np.ndarray:
+        """Downscale an oversized frame before detection.
+
+        The detector letterboxes to ``detection_size`` internally, so a 12 MP
+        phone capture buys no extra detection accuracy — it only makes that
+        resize more expensive, and every later retry pass too. Capping the longer
+        side keeps the face far above the 112 px the recognizer needs.
+        """
+        cap = self._max_input_side
+        if cap <= 0:
+            return image_rgb
+        h, w = image_rgb.shape[:2]
+        longer = max(h, w)
+        if longer <= cap:
+            return image_rgb
+        scale = cap / float(longer)
+        return cv2.resize(
+            image_rgb,
+            (max(1, int(round(w * scale))), max(1, int(round(h * scale)))),
+            interpolation=cv2.INTER_AREA,
+        )
 
     def _select_face(self, image_rgb: np.ndarray, det_thresh: float | None = None) -> Face | None:
         """Detect faces and select the best one for recognition.
@@ -324,6 +435,8 @@ class FaceEmbeddingService(ModelService):
         Returns:
             dict: {"image": image used for recognition, "face": Face or None}
         """
+        image_rgb = self._cap_input(image_rgb)
+
         # 1. primary pass — clean, well-aligned (covers normal selfies/photos)
         face = self._select_face(image_rgb)
         if face is not None:
@@ -388,6 +501,7 @@ class FaceEmbeddingService(ModelService):
         app = self.load_model()
         rec = app.models["recognition"]
         image = preprocessed_data["image"]
+        want_sharpness = preprocessed_data.get("want_sharpness", True)
 
         if not self._enable_flip_tta:
             embedding = rec.get(image, face)
@@ -399,7 +513,9 @@ class FaceEmbeddingService(ModelService):
             embedding = rec.get_feat(aligned).flatten() + rec.get_feat(cv2.flip(aligned, 1)).flatten()
 
         det_score = float(getattr(face, "det_score", 0.0) or 0.0)
-        sharpness = self._face_region_sharpness(image, face)
+        # Only the document path reads sharpness; a face match would pay for a
+        # full-resolution Laplacian it never looks at.
+        sharpness = self._face_region_sharpness(image, face) if want_sharpness else None
         return np.asarray(embedding, dtype=np.float32), True, det_score, sharpness
 
     def postprocess(self, output: tuple) -> FaceEmbeddingResult:
@@ -445,6 +561,7 @@ class FaceEmbeddingService(ModelService):
         Returns:
             FaceDetectionResult: detection flag, normalized [x1, y1, x2, y2], score
         """
+        image_rgb = self._cap_input(image_rgb)
         detected = image_rgb
         face = self._select_face(image_rgb)
         if face is None and self._low_det_thresh < self._det_thresh:
@@ -468,15 +585,89 @@ class FaceEmbeddingService(ModelService):
         score = float(getattr(face, "det_score", 0.0) or 0.0)
         return FaceDetectionResult(face_detected=True, bbox=bbox, score=score)
 
-    def embed(self, image_rgb: np.ndarray) -> FaceEmbeddingResult:
+    def embed(self, image_rgb: np.ndarray, *, want_sharpness: bool = True) -> FaceEmbeddingResult:
         """Generate face embedding from image.
-
-        Convenience alias for ``forward()``.
 
         Args:
             image_rgb: Input face image in RGB format, shape (H, W, 3), dtype uint8
+            want_sharpness: Compute the face-region focus metric. Only the
+                document path uses it; face match passes False to skip a
+                full-resolution Laplacian it would not read.
 
         Returns:
             FaceEmbeddingResult: L2-normalized embedding vector with face detection status and metadata
         """
-        return self.forward(image_rgb)
+        preprocessed = self.preprocess(image_rgb)
+        preprocessed["want_sharpness"] = want_sharpness
+        return self.postprocess(self.predict(preprocessed))
+
+    def match_pair(
+        self,
+        probe_rgb: np.ndarray,
+        reference_rgb: np.ndarray,
+        *,
+        want_probe_sharpness: bool = False,
+    ) -> FaceMatchResult:
+        """Embed both sides and score them, all within this process.
+
+        Doing the comparison here rather than in the caller keeps two 512-float
+        vectors off the wire and out of JSON on the hot path. The sides are
+        embedded sequentially on purpose: under real concurrency every core is
+        already busy with other requests, so splitting one request across threads
+        adds contention without adding throughput.
+
+        A probe with no detectable face short-circuits — there is nothing to
+        compare it against, so the reference is never embedded.
+        """
+        probe_pre = self.preprocess(probe_rgb)
+        probe_pre["want_sharpness"] = want_probe_sharpness
+        probe_vec, probe_found, probe_det, probe_sharp = self.predict(probe_pre)
+
+        if not probe_found:
+            return FaceMatchResult(
+                score=None,
+                probe_face_detected=False,
+                reference_face_detected=False,
+                probe_face_sharpness=probe_sharp,
+            )
+
+        ref_vec, ref_found, ref_det = self.embed_vector(reference_rgb)
+        if not ref_found:
+            return FaceMatchResult(
+                score=None,
+                probe_face_detected=True,
+                reference_face_detected=False,
+                probe_det_score=probe_det,
+                probe_face_sharpness=probe_sharp,
+            )
+
+        probe_norm = float(np.linalg.norm(probe_vec))
+        if probe_norm > 0:
+            probe_vec = probe_vec / probe_norm
+
+        return FaceMatchResult(
+            score=float(np.dot(probe_vec, ref_vec)),
+            probe_face_detected=True,
+            reference_face_detected=True,
+            probe_det_score=probe_det,
+            reference_det_score=ref_det,
+            probe_face_sharpness=probe_sharp,
+        )
+
+    def embed_vector(self, image_rgb: np.ndarray) -> tuple[np.ndarray, bool, float | None]:
+        """Embed and return the raw vector, skipping the JSON-facing result model.
+
+        The match path compares two embeddings numerically and never serializes
+        them, so building a 512-element Python float list per side (and
+        validating it through Pydantic) is pure overhead. Returns
+        ``(l2_normalized_vector, face_detected, det_score)``.
+        """
+        preprocessed = self.preprocess(image_rgb)
+        preprocessed["want_sharpness"] = False
+        embedding, face_detected, det_score, _ = self.predict(preprocessed)
+        if not face_detected:
+            return embedding, False, None
+        norm = float(np.linalg.norm(embedding))
+        if norm > 0:
+            embedding = embedding / norm
+        return embedding, True, det_score

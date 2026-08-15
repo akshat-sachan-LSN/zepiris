@@ -10,15 +10,19 @@ class S3ImageFetcher:
 
     No AWS credentials: the URL must be directly retrievable. Guards against
     slow responses (timeout on the client) and oversized payloads (max_bytes).
+
+    Async because both images are fetched on every request: at high concurrency
+    a blocking fetch would hold a worker thread per in-flight request purely to
+    wait on a socket, and the thread pool — not S3 — would become the limit.
     """
 
-    def __init__(self, client: httpx.Client, max_bytes: int) -> None:
+    def __init__(self, client: httpx.AsyncClient, max_bytes: int) -> None:
         self._client = client
         self._max_bytes = max_bytes
 
-    def fetch(self, url: str) -> bytes:
+    async def fetch(self, url: str) -> bytes:
         try:
-            response = self._client.get(url, follow_redirects=True)
+            response = await self._client.get(url)
         except httpx.TimeoutException as exc:
             raise ReferenceImageFetchError(reason="timeout", detail_msg=str(exc)) from exc
         except httpx.HTTPError as exc:
@@ -39,5 +43,5 @@ class S3ImageFetcher:
             raise ReferenceImageFetchError(reason="empty", detail_msg="empty_body")
         return data
 
-    def close(self) -> None:
-        self._client.close()
+    async def aclose(self) -> None:
+        await self._client.aclose()

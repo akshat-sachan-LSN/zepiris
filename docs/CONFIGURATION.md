@@ -4,8 +4,8 @@ Complete configuration reference for ZepIris services.
 
 ## Environment Variables
 
-All configuration uses the `ZEPIRIS_` prefix. Values can be set via:
-1. Environment variables: `export ZEPIRIS_MILVUS_HOST=localhost`
+All main-API configuration uses the `ZEPIRIS_` prefix. Values can be set via:
+1. Environment variables: `export ZEPIRIS_VERIFY_THRESHOLD=0.5`
 2. `.env` file: Create `.env` in project root
 3. Python code: Edit `zepiris/config.py`
 
@@ -29,131 +29,67 @@ ZEPIRIS_API_TITLE=ZepIris Face Auth
 ZEPIRIS_API_VERSION=1.0.0
 ```
 
-## MinIO / S3 Configuration
+## Verification Configuration
 
-### ZEPIRIS_MINIO_ENDPOINT
-**Type**: `str`
-**Default**: `"localhost:9002"`
-**Description**: MinIO/S3 server address with port
-
-**Examples**:
-```env
-# Local MinIO (Docker Compose)
-ZEPIRIS_MINIO_ENDPOINT=localhost:9002
-
-# AWS S3
-ZEPIRIS_MINIO_ENDPOINT=s3.amazonaws.com
-
-# Custom S3-compatible (DigitalOcean Spaces, etc.)
-ZEPIRIS_MINIO_ENDPOINT=nyc3.digitaloceanspaces.com
-```
-
-### ZEPIRIS_MINIO_ACCESS_KEY
-**Type**: `str`
-**Default**: `"minioadmin"`
-**Description**: Access key for S3 authentication
-
-### ZEPIRIS_MINIO_SECRET_KEY
-**Type**: `str`
-**Default**: `"minioadmin"`
-**Description**: Secret key for S3 authentication
-
-⚠️ **Security Warning**: Use strong passwords in production!
+### ZEPIRIS_VERIFY_THRESHOLD
+**Type**: `float`
+**Default**: `0.5`
+**Description**: Default cosine-similarity match threshold for `POST /v1/faces/verify`.
+A request is a match when `score >= threshold`. Can be overridden per request via
+the `threshold` form field.
 
 ```env
-ZEPIRIS_MINIO_ACCESS_KEY=your_strong_access_key_here
-ZEPIRIS_MINIO_SECRET_KEY=your_strong_secret_key_here
+ZEPIRIS_VERIFY_THRESHOLD=0.5
 ```
 
-### ZEPIRIS_MINIO_BUCKET
-**Type**: `str`
-**Default**: `"zepiris"`
-**Description**: Bucket name for storing images
-
-**Notes**:
-- Must follow S3 bucket naming rules (lowercase, no underscores)
-- Created automatically if doesn't exist
+### ZEPIRIS_DOC_MIN_SHARPNESS
+**Type**: `float`
+**Default**: `0.0` (disabled — report only, never reject)
+**Description**: Minimum sharpness (variance-of-Laplacian) for the face extracted
+from a document in `POST /v1/faces/docmatch/verify`. Blurry phone captures of a
+card embed poorly and silently drag the match score down. The extracted face's
+sharpness is always reported in the response `documentFace` block; when this is
+set `> 0`, a face below it is rejected with `422 document_too_blurry` so the
+caller can request a clearer photo. A crisp ID photo typically scores `> 100`;
+observed blurry captures fall in the `5–20` range, so a threshold around `25–40`
+is a reasonable starting point.
 
 ```env
-ZEPIRIS_MINIO_BUCKET=face-auth-prod
+ZEPIRIS_DOC_MIN_SHARPNESS=30
 ```
 
-### ZEPIRIS_MINIO_SECURE
-**Type**: `bool`
-**Default**: `false`
-**Description**: Use HTTPS/TLS for MinIO connection
+### ZEPIRIS_REFERENCE_FETCH_TIMEOUT_SECONDS
+**Type**: `float`
+**Default**: `10.0`
+**Description**: HTTP timeout (seconds) when fetching an image from a supplied
+S3 URL (any of `source_selfie_s3`, `face_check_s3`, `doc_check_s3`). If the
+fetch exceeds this, the request fails with `reference_image_fetch_failed`
+(HTTP 400).
 
 ```env
-# Local development (HTTP)
-ZEPIRIS_MINIO_SECURE=false
-
-# Production (HTTPS)
-ZEPIRIS_MINIO_SECURE=true
+ZEPIRIS_REFERENCE_FETCH_TIMEOUT_SECONDS=10.0
 ```
 
-## Milvus Configuration
-
-### ZEPIRIS_MILVUS_HOST
-**Type**: `str`
-**Default**: `"localhost"`
-**Description**: Milvus server hostname or IP
-
-```env
-# Docker Compose
-ZEPIRIS_MILVUS_HOST=milvus
-
-# Local
-ZEPIRIS_MILVUS_HOST=localhost
-
-# Remote
-ZEPIRIS_MILVUS_HOST=milvus.example.com
-```
-
-### ZEPIRIS_MILVUS_PORT
+### ZEPIRIS_REFERENCE_MAX_BYTES
 **Type**: `int`
-**Default**: `19530`
-**Description**: Milvus gRPC API port
+**Default**: `5242880` (5 MB)
+**Description**: Maximum allowed size (bytes) of the fetched reference image. A
+larger body fails with `reference_image_fetch_failed` (HTTP 400).
 
 ```env
-ZEPIRIS_MILVUS_PORT=19530
+ZEPIRIS_REFERENCE_MAX_BYTES=5242880
 ```
 
-### ZEPIRIS_MILVUS_COLLECTION
-**Type**: `str`
-**Default**: `"zepiris_faces"`
-**Description**: Milvus collection name for face embeddings
-
-**Notes**:
-- Collection is created automatically on startup
-- Schema: `face_id (PK), tenant, object_key, embedding (FLOAT_VECTOR)`
-- Supports multi-tenancy: each tenant has isolated face namespace
-
-```env
-ZEPIRIS_MILVUS_COLLECTION=face_embeddings_prod
-```
-
-### ZEPIRIS_MILVUS_EMBEDDING_DIM
-**Type**: `int`
-**Default**: `512`
-**Description**: Dimensionality of face embedding vectors
-
-**Common Values**:
-- `128` - Fast but less accurate
-- `256` - Good balance
-- `512` - Default, good accuracy
-- `768` - High accuracy (slower)
-
-⚠️ **Important**: This must match your embedding model output!
-
-```env
-ZEPIRIS_MILVUS_EMBEDDING_DIM=512
-```
+## ML Inference Configuration
 
 ### ZEPIRIS_ML_INFERENCE_SERVICE_URL
 **Type**: `str` (**required**)
-**Description**: Base URL of the ML inference microservice. The main API **always** calls it for **`POST /v1/iqa/assess`** (NSFW, spoof, blur) and **`POST /v1/face/embed`** (face embedding) after encoding the upload as base64 JPEG.
+**Description**: Base URL of the ML inference microservice. The main API **always**
+calls it for **`POST /v1/iqa/assess`** (NSFW, spoof, blur) and **`POST /v1/face/embed`**
+(face embedding) after encoding images as base64 JPEG.
 
-If `ZEPIRIS_ML_INFERENCE_SERVICE_URL` is empty, **`ML_INFERENCE_SERVICE_URL`** (no `ZEPIRIS_` prefix) is used instead. One of these must be set or **startup fails**.
+If `ZEPIRIS_ML_INFERENCE_SERVICE_URL` is empty, **`ML_INFERENCE_SERVICE_URL`**
+(no `ZEPIRIS_` prefix) is used instead. One of these must be set or **startup fails**.
 
 ```env
 # Docker Compose (service name)
@@ -163,125 +99,148 @@ ZEPIRIS_ML_INFERENCE_SERVICE_URL=http://ml-inference:8001
 ZEPIRIS_ML_INFERENCE_SERVICE_URL=http://localhost:8001
 ```
 
+### ZEPIRIS_ML_INFERENCE_TIMEOUT_SECONDS
+**Type**: `float`
+**Default**: `60.0`
+**Description**: Per-request HTTP timeout (seconds) for calls to the ML inference
+service. CPU embedding (antelopev2/ResNet100) plus the multi-pass face-detection
+fallback cascade can far exceed httpx's 5s default on hard document images, so
+keep this generous.
+
+```env
+ZEPIRIS_ML_INFERENCE_TIMEOUT_SECONDS=60.0
+```
+
+## Adaptive Learning (online threshold calibration)
+
+The recognition model is never retrained in production; what keeps learning is
+the **decision threshold**, per document type (`aadhaar`, `pan`, ...). Every
+scored verification logs its match score (no images, no PII); operator
+feedback via `POST /v1/faces/feedback` labels those scores, and the threshold
+for that document type is re-fit to meet the false-accept-rate target. State
+is plain JSONL/JSON under `ZEPIRIS_LEARNING_DIR`.
+
+### ZEPIRIS_LEARNING_ENABLED
+**Type**: `bool`
+**Default**: `true`
+**Description**: Master switch. When `false`, nothing is logged and learned
+thresholds are ignored.
+
+### ZEPIRIS_LEARNING_DIR
+**Type**: `str`
+**Default**: `learning`
+**Description**: Directory for `samples.jsonl`, `feedback.jsonl`, and
+`thresholds.json`. Delete it to reset all learned state.
+
+### ZEPIRIS_LEARNING_MIN_GENUINE / ZEPIRIS_LEARNING_MIN_IMPOSTOR
+**Type**: `int`
+**Default**: `20` / `20`
+**Description**: Labelled genuine / impostor outcomes required for a document
+type before its threshold is learned; until then the configured default
+threshold applies.
+
+### ZEPIRIS_LEARNING_FAR_TARGET
+**Type**: `float`
+**Default**: `0.01`
+**Description**: Maximum false-accept rate the fitted threshold may allow on
+the labelled data. The fit maximizes true-accepts subject to this cap, and the
+result is always clamped to `[0.25, 0.70]` so bad labels cannot push the
+system into absurd behavior.
+
+```env
+ZEPIRIS_LEARNING_ENABLED=true
+ZEPIRIS_LEARNING_DIR=learning
+ZEPIRIS_LEARNING_MIN_GENUINE=20
+ZEPIRIS_LEARNING_MIN_IMPOSTOR=20
+ZEPIRIS_LEARNING_FAR_TARGET=0.01
+```
+
 ## Image quality (IQA)
 
-There are **no** `ZEPIRIS_IQA_*` knobs on the main API. Image quality is determined entirely by the **ml-inference** service (`POST /v1/iqa/assess`). Tune blur, NSFW, and spoof behavior with **`ML_SERVICE_*`** environment variables on that container (see `zepiris/ml_inference/app.py` and `.env.example`).
-
-## Advanced Configuration
-
-### Custom Milvus Settings
-
-Edit `/milvus/configs/milvus.yaml` (in Docker) or environment:
-
-```env
-# Search parameters
-MILVUS_SEARCH_NLIST=128
-MILVUS_SEARCH_NPROBE=8
-
-# Memory settings
-MILVUS_MEMORY_HIGH_WATERMARK=0.95
-MILVUS_MEMORY_LOW_WATERMARK=0.85
-```
-
-### Custom MinIO Settings
-
-For production S3/MinIO deployments:
-
-```env
-# Performance
-MINIO_ACCESS_CONCURRENCY=20
-MINIO_UPLOAD_TIMEOUT=24h
-
-# Security
-MINIO_ENABLE_HTTPS=true
-MINIO_CERT_FILE=/path/to/cert.pem
-MINIO_KEY_FILE=/path/to/key.pem
-```
+There are **no** `ZEPIRIS_IQA_*` knobs on the main API. Image quality is
+determined entirely by the **ml-inference** service (`POST /v1/iqa/assess`). Tune
+blur, NSFW, and spoof behavior with **`ML_SERVICE_*`** environment variables on
+that container (see `zepiris/ml_inference/app.py` and `.env.example`).
 
 ## Configuration Presets
 
 ### Development Preset
 ```env
 # .env for local development
-ZEPIRIS_MINIO_ENDPOINT=localhost:9002
-ZEPIRIS_MINIO_SECURE=false
-ZEPIRIS_MILVUS_HOST=localhost
+ZEPIRIS_VERIFY_THRESHOLD=0.5
+ZEPIRIS_REFERENCE_FETCH_TIMEOUT_SECONDS=10.0
 ZEPIRIS_ML_INFERENCE_SERVICE_URL=http://localhost:8001
 ```
 
-### Production Preset (AWS)
+### Production Preset
 ```env
-# .env for production with AWS
-ZEPIRIS_MINIO_ENDPOINT=s3.amazonaws.com
-ZEPIRIS_MINIO_BUCKET=your-prod-bucket
-ZEPIRIS_MINIO_SECURE=true
-ZEPIRIS_MILVUS_HOST=milvus-prod.internal
+# .env for production
+ZEPIRIS_VERIFY_THRESHOLD=0.6
+ZEPIRIS_REFERENCE_FETCH_TIMEOUT_SECONDS=8.0
+ZEPIRIS_REFERENCE_MAX_BYTES=5242880
 ZEPIRIS_ML_INFERENCE_SERVICE_URL=http://ml-inference.internal:8001
-ZEPIRIS_MILVUS_EMBEDDING_DIM=768
 ```
 
 ### Kubernetes Preset
 ```env
 # .env for Kubernetes deployment
-ZEPIRIS_MINIO_ENDPOINT=minio.default.svc.cluster.local:9000
-ZEPIRIS_MILVUS_HOST=milvus.default.svc.cluster.local
-ZEPIRIS_MINIO_BUCKET=zepiris-prod
-ZEPIRIS_MILVUS_COLLECTION=zepiris_faces_prod
+ZEPIRIS_VERIFY_THRESHOLD=0.5
+ZEPIRIS_ML_INFERENCE_SERVICE_URL=http://ml-inference.default.svc.cluster.local:8001
 ```
 
 ## Configuration Validation
 
 On startup, ZepIris validates:
 - ✓ `ZEPIRIS_ML_INFERENCE_SERVICE_URL` (or `ML_INFERENCE_SERVICE_URL`) is set
-- ✓ Milvus connectivity
-- ✓ MinIO bucket accessibility
-- ✓ Embedding dimension is positive
+- ✓ Verify threshold and reference limits are positive
 
 **Validation Errors** appear in logs:
 ```
-[ERROR] Could not connect to Milvus at localhost:19530
-[ERROR] MinIO bucket 'zepiris' does not exist and could not be created
+[ERROR] ML_INFERENCE_SERVICE_URL is required but not set
 ```
 
 ## Performance Tuning
 
-### For High Throughput
+### Stricter matching
 ```env
-ZEPIRIS_MILVUS_EMBEDDING_DIM=256  # Smaller vectors = faster search
-# Stricter or looser IQA: adjust ML_SERVICE_* on the ml-inference container
+ZEPIRIS_VERIFY_THRESHOLD=0.7   # require higher cosine similarity to accept
 ```
 
-### For High Accuracy
+### Looser matching
 ```env
-ZEPIRIS_MILVUS_EMBEDDING_DIM=768  # Larger vectors = more accurate
-# Stricter blur/NSFW/spoof: adjust ML_SERVICE_* on the ml-inference container
+ZEPIRIS_VERIFY_THRESHOLD=0.4   # accept lower cosine similarity
 ```
 
-### For Large Datasets
+### Image quality
+Adjust blur/NSFW/spoof sensitivity via `ML_SERVICE_*` on the ml-inference
+container, e.g.:
+
 ```env
-ZEPIRIS_MILVUS_COLLECTION=zepiris_faces_large
-# Use distributed Milvus setup (see Kubernetes guide)
+ML_SERVICE_BLUR_THRESHOLD=0.85
 ```
+(Set on the `ml-inference` service / its `.env`, not on the main API.)
 
 ## Troubleshooting Configuration
 
-### Issue: "Connection refused" for Milvus
+### Issue: Main API fails to start
 ```bash
-# Check Milvus is running
-docker-compose ps milvus
-
-# Check host/port
-echo $ZEPIRIS_MILVUS_HOST
-echo $ZEPIRIS_MILVUS_PORT
+# ML inference URL is required — make sure it is set
+echo $ZEPIRIS_ML_INFERENCE_SERVICE_URL
+export ZEPIRIS_ML_INFERENCE_SERVICE_URL=http://localhost:8001
 ```
 
-### Issue: "MinIO bucket not found"
-```bash
-# Create bucket
-docker exec zepiris-minio mc mb minio/zepiris
+### Issue: `reference_image_fetch_failed`
+- The supplied S3 URL (`source_selfie_s3` / `face_check_s3` / `doc_check_s3`)
+  may be expired, unreachable, returned 404, or the body exceeded
+  `ZEPIRIS_REFERENCE_MAX_BYTES`.
+- The fetch may have exceeded `ZEPIRIS_REFERENCE_FETCH_TIMEOUT_SECONDS`. Increase
+  the timeout if your reference store is slow:
+
+```env
+ZEPIRIS_REFERENCE_FETCH_TIMEOUT_SECONDS=20.0
 ```
 
-### Issue: Images failing IQA
+### Issue: Live photo failing IQA
 IQA is enforced by **ml-inference** (`/v1/iqa/assess`). Loosen thresholds there, e.g.:
 
 ```env
@@ -300,7 +259,7 @@ Settings are loaded in order (highest priority first):
 Example:
 ```bash
 # Override with environment variable
-export ZEPIRIS_MILVUS_HOST=remote-milvus.com
+export ZEPIRIS_VERIFY_THRESHOLD=0.6
 docker-compose up
 ```
 
@@ -311,16 +270,15 @@ docker-compose up
 # Comments start with #
 ZEPIRIS_API_TITLE=ZepIris
 
-# Multiline values (not typical for config)
 # Quote if value contains spaces
 ZEPIRIS_API_TITLE="My ZepIris Service"
 
-# Boolean values
-ZEPIRIS_MINIO_SECURE=true  # or false
+# Floats
+ZEPIRIS_VERIFY_THRESHOLD=0.5
+ZEPIRIS_REFERENCE_FETCH_TIMEOUT_SECONDS=10.0
 
-# Numbers
-ZEPIRIS_MILVUS_PORT=19530
-ZEPIRIS_IQA_MIN_LAPLACIAN_VARIANCE=50.0
+# Integers
+ZEPIRIS_REFERENCE_MAX_BYTES=5242880
 ```
 
 ## Loading Custom Configuration
@@ -330,8 +288,8 @@ ZEPIRIS_IQA_MIN_LAPLACIAN_VARIANCE=50.0
 from zepiris.config import Settings
 
 settings = Settings(
-    minio_endpoint="custom:9000",
-    milvus_host="custom-milvus"
+    verify_threshold=0.6,
+    ml_inference_service_url="http://localhost:8001",
 )
 ```
 
@@ -349,24 +307,13 @@ poetry run uvicorn zepiris.main:app
    echo ".env" >> .gitignore
    ```
 
-2. **Use strong passwords**
-   ```bash
-   # Generate secure key
-   openssl rand -base64 32
-   ```
+2. **Use presigned, short-lived S3 URLs** for reference images so they cannot be
+   replayed after expiry.
 
-3. **Rotate credentials regularly**
-   - Update MinIO keys monthly
-   - Audit Milvus access logs
+3. **Use TLS/HTTPS in production** for both the API and the reference image URLs.
 
-4. **Use TLS/HTTPS in production**
-   ```env
-   ZEPIRIS_MINIO_SECURE=true
-   ```
-
-5. **Restrict network access**
-   - Milvus: only from API servers
-   - MinIO: only from API servers
+4. **Restrict network access**
+   - ml-inference: only reachable from the main API.
 
 ## See Also
 

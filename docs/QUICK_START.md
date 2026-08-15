@@ -3,10 +3,10 @@
 **Pick the right guide:**
 
 ## 🚀 I Want to Test Locally RIGHT NOW
-→ **[docs/LOCAL_SETUP_AND_TEST.md](docs/LOCAL_SETUP_AND_TEST.md)** (20-30 min)
+→ **[docs/LOCAL_SETUP_AND_TEST.md](docs/LOCAL_SETUP_AND_TEST.md)** (15-20 min)
 - Complete step-by-step guide
-- Start Docker services
-- Test all 4 endpoints
+- Start the 2 Docker services (api + ml-inference)
+- Test the verify endpoint
 - Troubleshoot issues
 - **USE THIS ONE** ✅
 
@@ -26,17 +26,17 @@
 
 ## 📚 I Want Complete API Documentation
 → **[docs/API_REFERENCE.md](docs/API_REFERENCE.md)**
-- All 7 endpoints documented
-- Request/response examples
+- The `/v1/faces/verify` and `/v1/faces/detect` endpoints
+- Request/response examples (success, early-exit, errors)
 - Error codes
 - cURL & Python examples
 
 ## ⚙️ I Want to Configure Everything
 → **[docs/CONFIGURATION.md](docs/CONFIGURATION.md)**
 - All environment variables
-- Milvus settings
-- MinIO settings
-- IQA thresholds
+- Verify threshold & reference-fetch settings
+- ML inference service URL
+- IQA thresholds (on ml-inference)
 - Performance tuning
 
 ## 👨‍💻 I Want to Contribute Code
@@ -55,18 +55,30 @@
 
 ## The Fastest Path to Testing
 
+ZepIris is a **stateless 1:1 face-verification** service. It runs as **2
+containers** — `api` and `ml-inference` — with no Milvus, MinIO, or etcd. The
+reference image is supplied as an S3 URL and nothing is persisted.
+
 ```bash
-# 1. Start services
+# 1. Start services (api + ml-inference)
 cd zepiris
 docker-compose up -d
 
 # 2. Check health
 curl http://localhost:8000/healthz
 
-# 3. Open interactive API docs
-# http://localhost:8000/docs
+# 3. Verify an incoming live face against the enrolled selfie (source of truth)
+#    face_check = the image being verified; source_selfie = your DB's enrolled selfie
+#    JSON body; each side accepts base64 OR an S3 URL — see API_REFERENCE.md
+curl -X POST http://localhost:8000/v1/faces/facematch/verify \
+  -H "Content-Type: application/json" \
+  -d '{
+    "face_check_s3": "https://your-bucket.s3.amazonaws.com/incoming.jpg?X-Amz-Signature=...",
+    "source_selfie_s3": "https://your-bucket.s3.amazonaws.com/enrolled.jpg?X-Amz-Signature=..."
+  }'
 
-# 4. For detailed tests, follow LOCAL_SETUP_AND_TEST.md Step 5-7
+# 4. Open interactive API docs
+# http://localhost:8000/docs
 ```
 
 ---

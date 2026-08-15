@@ -23,6 +23,33 @@ class FaceEmbeddingResult(BaseModel):
     face_sharpness: float | None = None
 
 
+class FaceMatchResult(BaseModel):
+    """Result of a 1:1 comparison done entirely inside the ML service.
+
+    Embedding both sides and scoring them in one call keeps the 512-float
+    vectors off the wire: the caller only needs the similarity, so serializing
+    two embeddings across an HTTP hop just to compute a dot product on the other
+    side is work with no consumer.
+
+    Attributes:
+        score: Cosine similarity of the two embeddings in [-1, 1], or None when
+            either side had no detectable face.
+        probe_face_detected: Whether a face was found in the probe image
+        reference_face_detected: Whether a face was found in the reference image
+        probe_det_score: Detector confidence for the probe face (None when absent)
+        reference_det_score: Detector confidence for the reference face
+        probe_face_sharpness: Variance-of-Laplacian of the probe face region;
+            populated only when the caller asks for it (document path).
+    """
+
+    score: float | None = None
+    probe_face_detected: bool
+    reference_face_detected: bool
+    probe_det_score: float | None = None
+    reference_det_score: float | None = None
+    probe_face_sharpness: float | None = None
+
+
 class FaceDetectionResult(BaseModel):
     """Result of a lightweight face-detection-only pass (no recognition).
 

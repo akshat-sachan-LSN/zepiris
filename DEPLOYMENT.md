@@ -30,9 +30,23 @@ Response time, measured locally on an 8-core CPU against **real prod images**
 | Original | ~1.9 s (prod was 10–11 s) |
 | detect-once + parallel S3 fetch + off-event-loop | ~0.7 s |
 | + liveness gate OFF | ~0.4 s (tiny images) / ~1.1 s (real images) |
-| **+ flip-TTA off + detector 512** (current) | **~0.75 s (real images)** |
+| + flip-TTA off + detector 512 | ~0.75 s (real images) |
+| **+ single-call binary match path + tuned ORT + tier** (current) | **see below** |
 
-Throughput anchor for sizing: **~3–4 req/s per 4 vCPU**.
+Throughput anchors for sizing, measured on one 8-core machine with distinct
+images per request (see [docs/PERFORMANCE.md](docs/PERFORMANCE.md)):
+
+| Tier | Throughput | Per 4 vCPU |
+|---|---|---|
+| Previous pipeline | 3.4 req/s | ~1.7 req/s |
+| `balanced` (default, accuracy unchanged) | 9.8 req/s | ~4.9 req/s |
+| `fast` (needs threshold recalibration) | 41–52 req/s | ~21–26 req/s |
+
+**Sizing rule:** sustainable concurrency = throughput x deadline. Holding 100
+concurrent requests under 500 ms therefore needs **200 req/s** — roughly 30 vCPU
+of ML capacity on the `fast` tier, and not practical on CPU with the others.
+See [docs/PERFORMANCE.md](docs/PERFORMANCE.md) for the full analysis, the
+accuracy comparison across tiers, and the load-test procedure.
 
 ---
 

@@ -29,6 +29,7 @@ from zepiris.schemas.ml_inference import (
     BlurDetectionResult,
     FaceDetectionResult,
     FaceEmbeddingResult,
+    FaceMatchResult,
     ImageQualityAssessmentResult,
     NSFWDetectionResult,
     SpoofDetectionResult,
@@ -185,3 +186,80 @@ class MLInferenceClient:
     def __exit__(self, *args) -> None:
         """Context manager exit."""
         self.close()
+
+
+class AsyncMLInferenceClient:
+    """Async client for the hot verification path.
+
+    The API process does no image work of its own — it fetches bytes and waits on
+    the ML service — so it should hold requests on the event loop rather than
+    parking a worker thread per in-flight call. At 100 concurrent verifications
+    the sync client would need 100 threads to do nothing but block on a socket.
+
+    Connection-pool limits are set explicitly: httpx defaults to 20 keep-alive
+    connections, so beyond that every request pays a fresh TCP handshake and
+    connections churn exactly when load is highest.
+    """
+
+    def __init__(
+        self,
+        base_url: str,
+        timeout_seconds: float = 60.0,
+        max_connections: int = 200,
+        connect_timeout_seconds: float = 5.0,
+    ) -> None:
+        """
+        Args:
+            base_url: Base URL of the ML inference service.
+            timeout_seconds: Read/write/pool timeout for a request.
+            max_connections: Pool ceiling; keep-alive is held at the same value so
+                a steady concurrent load reuses connections instead of churning.
+            connect_timeout_seconds: Separate, shorter budget for establishing a
+                connection — a dead upstream should fail fast, not consume the
+                full inference timeout.
+        """
+        self.base_url = base_url.rstrip("/")
+        self.client = httpx.AsyncClient(
+            base_url=self.base_url,
+            timeout=httpx.Timeout(
+                timeout_seconds, connect=connect_timeout_seconds
+            ),
+            limits=httpx.Limits(
+                max_connections=max_connections,
+                max_keepalive_connections=max_connections,
+                keepalive_expiry=60.0,
+            ),
+        )
+
+    async def match_faces(
+        self,
+        probe: bytes,
+        reference: bytes,
+        *,
+        want_probe_sharpness: bool = False,
+    ) -> FaceMatchResult:
+        """Score a 1:1 pair, sending both images as raw multipart bytes.
+
+        The images go over the wire exactly as they arrived — no base64, no
+        re-encode — and only the similarity comes back.
+        """
+        response = await self.client.post(
+            "/v1/face/match",
+            files={
+                "probe": ("probe", probe, "application/octet-stream"),
+                "reference": ("reference", reference, "application/octet-stream"),
+            },
+            params={"want_probe_sharpness": str(want_probe_sharpness).lower()},
+        )
+        response.raise_for_status()
+        return FaceMatchResult(**response.json())
+
+    async def healthz(self) -> dict[str, str]:
+        """Check service health."""
+        response = await self.client.get("/healthz")
+        response.raise_for_status()
+        return response.json()
+
+    async def aclose(self) -> None:
+        """Close the underlying HTTP client."""
+        await self.client.aclose()

@@ -36,6 +36,31 @@ class Settings(BaseSettings):
     # can take well over httpx's 5s default on hard document images.
     ml_inference_timeout_seconds: float = 60.0
 
+    # -- throughput / concurrency -------------------------------------------
+    #: How this process scores a pair. "remote" (default) sends both images to
+    #: the ML service in one call, keeping the two services independently
+    #: scalable. "local" loads the models here instead — no HTTP hop at all,
+    #: lowest latency, but it needs the ML extras installed alongside the API.
+    match_mode: str = "remote"
+    #: Face tier used when match_mode="local" — see zepiris.ml_inference.face_engine.
+    local_face_tier: str = "balanced"
+    local_device: str = "cpu"
+    local_intra_op_threads: int = 1
+    #: Connection-pool ceiling toward the ML service. httpx keeps only 20
+    #: connections alive by default, so past that every request pays a fresh
+    #: handshake exactly when load is highest. Size this at or above peak
+    #: in-flight requests per API process.
+    ml_max_connections: int = 200
+    #: Connection-pool ceiling for reference-image fetches (two per request).
+    s3_max_connections: int = 200
+    #: Worker threads for the few remaining sync call sites. This process is
+    #: I/O-bound — it fetches images and awaits the ML service — so it needs far
+    #: fewer threads than it carries concurrent requests.
+    thread_pool_size: int = 64
+    #: Uvicorn worker processes. The API is I/O-bound, so a couple of workers
+    #: saturate a small instance; the CPU cost lives in the ML service.
+    api_workers: int = 2
+
     # -- adaptive learning (online threshold calibration) --------------------
     # Every scored verification is logged (scores only, never images) and the
     # /feedback endpoint lets operators confirm outcomes; per-document-type
@@ -57,10 +82,16 @@ class Settings(BaseSettings):
         if not u:
             u = (os.environ.get("ML_INFERENCE_SERVICE_URL") or "").strip()
         if not u:
+            if self.match_mode == "local":
+                # match_mode=local runs the models in this process, so there is no
+                # ML service to point at. Requiring a URL here would force a
+                # meaningless value into every single-container deployment.
+                return self
             raise ValueError(
                 "ZEPIRIS_ML_INFERENCE_SERVICE_URL is required "
                 "(e.g. http://ml-inference:8001 or http://localhost:8001). "
-                "Alternatively set ML_INFERENCE_SERVICE_URL."
+                "Alternatively set ML_INFERENCE_SERVICE_URL, "
+                "or set ZEPIRIS_MATCH_MODE=local to run the models in-process."
             )
         self.ml_inference_service_url = u
         return self
