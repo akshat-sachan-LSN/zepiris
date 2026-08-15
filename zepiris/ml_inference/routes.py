@@ -6,11 +6,12 @@ import base64
 
 import cv2
 import numpy as np
-from fastapi import APIRouter, File, HTTPException, Request, UploadFile
+from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from starlette.concurrency import run_in_threadpool
 
+from zepiris.framing import FrameError, decode_pair_frame
 from zepiris.ml_inference.deps import (
     BlurDep,
     FaceEmbeddingDep,
@@ -137,24 +138,30 @@ def metrics(request: Request) -> dict:
 async def match_faces(
     request: Request,
     service: FaceEmbeddingDep,
-    probe: UploadFile = File(..., description="Image being verified (live face or document)"),
-    reference: UploadFile = File(..., description="Enrolled reference selfie"),
     want_probe_sharpness: bool = False,
 ) -> FaceMatchResult:
     """Score one 1:1 pair from raw image bytes — the whole hot path in one call.
 
-    Both images arrive as multipart binary, exactly as they were uploaded. That
-    removes the entire serialization tax the two-call embed path paid per side:
-    a decode, a lossless PNG re-encode (~30 ms and ~10x the bytes), base64 in and
-    out, and a second HTTP round trip. Only the similarity comes back, so the
+    The body is both original images end to end behind a 4-byte length prefix,
+    not multipart. Multipart spools any part over 1 MB to a temporary **file**,
+    so every request carrying a normal phone photo wrote to disk and read it back
+    — pointless I/O on a service that persists nothing, and at high request rates
+    a genuine source of disk churn. A framed body stays in memory and skips
+    boundary scanning entirely.
+
+    This is on top of what the single-call design already removed per side: a
+    decode, a lossless PNG re-encode (~30 ms and ~10x the bytes), base64 both
+    ways, and a second HTTP round trip. Only the similarity comes back, so the
     512-float vectors never touch JSON.
 
     Concurrency is bounded by the service's inference limiter; callers past the
     limit wait briefly and are then shed with 503 rather than queueing past their
     own timeout.
     """
-    probe_raw = await probe.read()
-    reference_raw = await reference.read()
+    try:
+        probe_raw, reference_raw = decode_pair_frame(await request.body())
+    except FrameError as exc:
+        raise HTTPException(status_code=400, detail=f"malformed_frame: {exc}") from exc
 
     limiter = request.app.state.inference_limiter
     async with limiter.slot():

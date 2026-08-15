@@ -128,5 +128,6 @@ def run() -> None:
         host=settings.api_host,
         port=settings.api_port,
         workers=settings.api_workers,
+        access_log=settings.access_log,
         reload=False,
     )

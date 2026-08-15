@@ -806,6 +806,7 @@ poetry add torch torchvision --platform linux --python "^3.10"
 - **[docs/CONFIGURATION.md](docs/CONFIGURATION.md)** — Environment variables & tuning
 - **[docs/PERFORMANCE.md](docs/PERFORMANCE.md)** — Throughput, model tiers, and capacity sizing
 - **[docs/EC2_AUTOSCALING.md](docs/EC2_AUTOSCALING.md)** — EC2 autoscaling deployment plan
+- **[docs/CPU_VS_GPU.md](docs/CPU_VS_GPU.md)** — Compute choice and cost at 100 / 500 / 1000 req/s
 - **[CONTRIBUTING.md](CONTRIBUTING.md)** — Code guidelines & contribution workflow
 - **[.env.example](.env.example)** — Complete environment variable template
 

@@ -150,10 +150,10 @@ def build_engine(cfg: EngineConfig) -> FaceEngine:
     so = _session_options(cfg)
     providers = _providers(cfg.device)
 
-    det = SCRFD(
-        model_file=det_path,
-        session=onnxruntime.InferenceSession(det_path, so, providers=providers),
-    )
+    det_session = onnxruntime.InferenceSession(det_path, so, providers=providers)
+    det = SCRFD(model_file=det_path, session=det_session)
+    # ctx_id < 0 makes SCRFD.prepare force the session back onto CPU, which would
+    # silently undo the CUDA provider selected above.
     det.prepare(0 if cfg.device != "cpu" else -1, det_thresh=cfg.det_thresh, input_size=cfg.det_size)
 
     rec = ArcFaceONNX(
@@ -161,8 +161,13 @@ def build_engine(cfg: EngineConfig) -> FaceEngine:
         session=onnxruntime.InferenceSession(rec_path, so, providers=providers),
     )
 
+    # Report the provider actually in use, not the one requested. A missing CUDA
+    # wheel degrades to CPU with only a warning, and a GPU instance quietly
+    # running on its host cores looks exactly like a disappointing GPU — so the
+    # startup line has to state what really happened.
+    active = det.session.get_providers()
     logger.info(
-        "Face engine ready: tier=%s det=%s@%dx%d rec=%s intra_op=%d device=%s",
+        "Face engine ready: tier=%s det=%s@%dx%d rec=%s intra_op=%d device=%s provider=%s",
         cfg.tier,
         osp.basename(det_path),
         cfg.det_size[0],
@@ -170,5 +175,13 @@ def build_engine(cfg: EngineConfig) -> FaceEngine:
         osp.basename(rec_path),
         cfg.intra_op_threads,
         cfg.device,
+        active[0] if active else "unknown",
     )
+    if cfg.device != "cpu" and (not active or active[0] == "CPUExecutionProvider"):
+        logger.error(
+            "device=%s was requested but inference is running on %s — check that "
+            "onnxruntime-gpu is installed and the GPU is visible to the container",
+            cfg.device,
+            active[0] if active else "unknown",
+        )
     return FaceEngine(det, rec, cfg)

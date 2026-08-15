@@ -47,6 +47,10 @@ class MLServiceSettings(BaseSettings):
 
     host: str = "0.0.0.0"
     port: int = 8001
+    # Per-request access logging. This service sits behind the API on localhost,
+    # so its access log is a second copy of a request the API already saw and the
+    # load balancer already recorded — pure disk growth at high request rates.
+    access_log: bool = False
 
     ml_device: str = "cpu"
 
@@ -420,5 +424,6 @@ def run() -> None:
         "zepiris.ml_inference.app:app",
         host=s.host,
         port=s.port,
+        access_log=s.access_log,
         reload=False,
     )

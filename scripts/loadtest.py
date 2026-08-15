@@ -31,6 +31,10 @@ import cv2
 import httpx
 import numpy as np
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from zepiris.framing import encode_pair_frame  # noqa: E402
+
 
 def _percentile(values: list[float], pct: float) -> float:
     """Nearest-rank percentile; values must be sorted."""
@@ -117,10 +121,8 @@ async def _one_ml(
     try:
         r = await client.post(
             url,
-            files={
-                "probe": ("p", pair[0], "application/octet-stream"),
-                "reference": ("r", pair[1], "application/octet-stream"),
-            },
+            content=encode_pair_frame(pair[0], pair[1]),
+            headers={"Content-Type": "application/octet-stream"},
         )
         elapsed = (time.perf_counter() - t) * 1000
         if r.status_code != 200:

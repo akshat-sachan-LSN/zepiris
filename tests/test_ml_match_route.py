@@ -6,6 +6,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from zepiris.framing import encode_pair_frame
 from zepiris.ml_inference.concurrency import InferenceLimiter
 from zepiris.ml_inference.deps import FaceEmbeddingDep
 from zepiris.ml_inference.routes import router
@@ -43,17 +44,14 @@ def _client(service, *, limit=4) -> TestClient:
 
 
 def _post(client, probe=None, reference=None, **params):
-    # `is None` rather than a falsy check — an empty body is a case under test.
+    # `is None` rather than a falsy check — an empty image is a case under test.
     return client.post(
         "/v1/face/match",
-        files={
-            "probe": ("p", _jpeg() if probe is None else probe, "application/octet-stream"),
-            "reference": (
-                "r",
-                _jpeg() if reference is None else reference,
-                "application/octet-stream",
-            ),
-        },
+        content=encode_pair_frame(
+            _jpeg() if probe is None else probe,
+            _jpeg() if reference is None else reference,
+        ),
+        headers={"Content-Type": "application/octet-stream"},
         params=params,
     )
 
@@ -75,6 +73,45 @@ def test_decodes_both_images_from_raw_bytes() -> None:
     assert _post(_client(service)).status_code == 200
     assert service.calls[0]["probe_shape"] == (64, 64, 3)
     assert service.calls[0]["reference_shape"] == (64, 64, 3)
+
+
+def test_splits_the_frame_at_the_declared_boundary() -> None:
+    """Differently sized images must not bleed into each other."""
+    ok, buf = cv2.imencode(".jpg", np.full((32, 48, 3), 200, dtype=np.uint8))
+    assert ok
+    service = _Service(
+        FaceMatchResult(score=0.5, probe_face_detected=True, reference_face_detected=True)
+    )
+    _post(_client(service), probe=buf.tobytes(), reference=_jpeg())
+    assert service.calls[0]["probe_shape"] == (32, 48, 3)
+    assert service.calls[0]["reference_shape"] == (64, 64, 3)
+
+
+def test_rejects_a_truncated_frame() -> None:
+    service = _Service(
+        FaceMatchResult(score=0.5, probe_face_detected=True, reference_face_detected=True)
+    )
+    r = _client(service).post(
+        "/v1/face/match",
+        content=b"\x00\x00",
+        headers={"Content-Type": "application/octet-stream"},
+    )
+    assert r.status_code == 400
+    assert "malformed_frame" in r.json()["detail"]
+
+
+def test_rejects_a_frame_declaring_more_than_it_carries() -> None:
+    """A length prefix longer than the body must fail, not read past the end."""
+    service = _Service(
+        FaceMatchResult(score=0.5, probe_face_detected=True, reference_face_detected=True)
+    )
+    r = _client(service).post(
+        "/v1/face/match",
+        content=(999_999).to_bytes(4, "big") + b"short",
+        headers={"Content-Type": "application/octet-stream"},
+    )
+    assert r.status_code == 400
+    assert "malformed_frame" in r.json()["detail"]
 
 
 def test_sharpness_is_opt_in() -> None:

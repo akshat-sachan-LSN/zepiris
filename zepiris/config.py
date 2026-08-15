@@ -60,12 +60,23 @@ class Settings(BaseSettings):
     #: Uvicorn worker processes. The API is I/O-bound, so a couple of workers
     #: saturate a small instance; the CPU cost lives in the ML service.
     api_workers: int = 2
+    #: Per-request access logging. One line per request is a rounding error at
+    #: 10 req/s and roughly 13 GB/day at 1000 — and it duplicates what the load
+    #: balancer already records, with none of its retention controls. Off by
+    #: default; the ALB is the request log.
+    access_log: bool = False
 
     # -- adaptive learning (online threshold calibration) --------------------
     # Every scored verification is logged (scores only, never images) and the
     # /feedback endpoint lets operators confirm outcomes; per-document-type
     # thresholds (aadhaar, pan, ...) are then re-fit from the labelled scores.
-    learning_enabled: bool = True
+    #: Threshold calibration appends one JSON line per scored verification —
+    #: roughly 17 GB/day at 1000 req/s, on a service that otherwise persists
+    #: nothing. It is also process-local, so on an autoscaled fleet the file dies
+    #: with the instance and the samples are never joined with feedback anyway.
+    #: Enable it only with a deliberate destination (shared volume or a real
+    #: datastore) and a retention policy.
+    learning_enabled: bool = False
     learning_dir: str = "learning"
     learning_min_genuine: int = 20
     learning_min_impostor: int = 20

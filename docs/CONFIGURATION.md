@@ -122,9 +122,18 @@ is plain JSONL/JSON under `ZEPIRIS_LEARNING_DIR`.
 
 ### ZEPIRIS_LEARNING_ENABLED
 **Type**: `bool`
-**Default**: `true`
+**Default**: `false`
 **Description**: Master switch. When `false`, nothing is logged and learned
 thresholds are ignored.
+
+Defaults to off because enabling it has two production costs that are easy to
+miss. It appends one JSON line per scored verification — roughly 17 GB/day at
+1000 req/s, on a service that otherwise persists nothing — and the file is
+process-local, so on an autoscaled fleet it dies with the instance and the
+samples are never joined with the feedback that would calibrate anything.
+
+Turn it on when calibration is actually being run, with `ZEPIRIS_LEARNING_DIR`
+pointed at durable shared storage and a retention policy in place.
 
 ### ZEPIRIS_LEARNING_DIR
 **Type**: `str`

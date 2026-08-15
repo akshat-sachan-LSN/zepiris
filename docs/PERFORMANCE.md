@@ -149,6 +149,32 @@ and the margins will be narrower for every tier.
 
 ---
 
+## Sizing at the launch target — 100 req/s
+
+100 req/s against a 500 ms deadline means ~50 requests in flight. Unlike the
+larger targets below, this one is comfortably servable **without giving up any
+accuracy**:
+
+| Tier | req/s per 8 vCPU | `c7i.2xlarge` for 100 req/s | Thresholds |
+|---|---|---|---|
+| `accurate` | ~9.8 | 11 | unchanged |
+| **`balanced`** ← recommended | **~17.5** | **6** | **unchanged** |
+| `fast` | ~52 | 2 | must be recalibrated |
+
+Run `balanced`. It keeps the ResNet50 recognition weights — the model that
+produces the embedding and decides every match — so existing thresholds carry
+over and no recalibration campaign stands between you and launch. `fast` would
+cut the fleet to two instances, but moving the embedding space to save four
+`c7i.2xlarge` is a poor trade on a biometric decision system. That trade only
+starts paying at the scales below, where the CPU alternative stops being
+affordable at all.
+
+Derived from a clean full-path measurement of `fast` (52 req/s on 8 cores) plus
+per-tier model cost measured single-threaded. Conservative for uniform x86 cores
+— calibrate with `scripts/loadtest.py` on the instance type you intend to buy.
+
+---
+
 ## Sizing for 100 concurrent under 500 ms
 
 The target needs **200 req/s**. Measured ML-service capacity on 8 cores, distinct
@@ -183,9 +209,91 @@ Two caveats before you buy instances:
 
 ### If you need accuracy *and* the deadline
 
-Use a GPU. ResNet50 ArcFace at 112x112 is trivial work for even a small
-inference GPU, and one `g5.xlarge` clears 200 req/s while keeping `accurate`-tier
-weights. Set `ML_SERVICE_ML_DEVICE=cuda` and install `onnxruntime-gpu`.
+Use a GPU. ResNet50 ArcFace at 112x112 is trivial work for even a small inference
+GPU, and it keeps `accurate`-tier weights so no threshold moves. Sizing, card
+selection, and the deployment steps are in [CPU_VS_GPU.md](CPU_VS_GPU.md) —
+including why `g5.xlarge` is a trap (4 vCPU cannot decode fast enough to feed its
+own card).
+
+---
+
+## Scaling to 1000 req/s
+
+1000 req/s is **5x** the 100-concurrent target and roughly **40x** the busiest
+minute in production traffic today (~24 req/s, per `DEPLOYMENT.md`). Worth
+confirming it is a real requirement rather than a headroom figure before
+committing to the cost, because the cost is where this stops being a tuning
+exercise.
+
+### On CPU: it works, and it is expensive
+
+| | |
+|---|---|
+| Required | 1000 req/s, `fast` tier |
+| Measured | ~6.6 req/s per vCPU |
+| Fleet | **~150 vCPU ≈ 19 x `c7i.2xlarge`** |
+| On-demand | ~$5,750/month |
+| Mixed Spot (base on-demand) | ~$2,000–2,500/month |
+
+Nothing about the architecture breaks at this size — it is a linear scale-out of
+what §"Sizing" already describes, with `max-size` raised and the warm pool grown
+to match. It is simply a lot of instances to run for a face comparison.
+
+### On GPU: cheaper, and keeps the accurate model
+
+> Full comparison across 100 / 500 / 1000 req/s, card selection, and deployment
+> steps: [CPU_VS_GPU.md](CPU_VS_GPU.md).
+
+An A10G (`g5.xlarge`, ~$1.00/hr) runs ResNet50 at 112x112 in the thousands of
+images per second when work is **batched**. Two or three of them plausibly carry
+1000 req/s on `accurate`-tier weights, at ~$2,200/month — cheaper than the CPU
+fleet *and* without the threshold recalibration `fast` demands.
+
+**Two pieces of work stand between here and that number, and neither is done:**
+
+1. **`onnxruntime-gpu` with the CUDA execution provider.** The engine already
+   takes `device` and selects the provider (`face_engine.py`), but that path has
+   not been run on real GPU hardware.
+2. **Dynamic batching — the part that matters.** A GPU serving one image at a
+   time is mostly idle; the throughput above assumes requests are gathered into
+   batches of 16–32 before hitting the model. That means a micro-batching queue
+   (collect for ~5 ms, run together, scatter results) in front of the recognizer.
+   It does **not** exist today, and it is the difference between a GPU that is
+   ~5x a CPU core and one that is ~50x.
+
+Note that batching is a *GPU* optimization specifically. Measured on CPU it was
+**slower** — 3.5 vs 4.8 req/s for batch-2 versus two batch-1 runs — because with
+one thread per inference a batch just serializes the work while holding the
+session longer. That is why the current code deliberately does not batch.
+
+I have not built the batching queue because it cannot be validated here: there is
+no CUDA device in this environment, and shipping unvalidated inference code into
+a biometric verification path is not a reasonable trade. It is a well-understood
+piece of work — say the word and it can be built behind a flag, but it needs a
+real GPU instance to prove out before it carries traffic.
+
+### Free throughput before buying anything: shrink the images
+
+Input size is the largest client-side lever, measured on the `fast` tier at
+16-way concurrency:
+
+| Probe resolution | Payload | Throughput |
+|---|---|---|
+| 640 x 854 | ~74 KB | **37.7 req/s** |
+| 900 x 1200 | ~121 KB | 29.5 req/s |
+| 1200 x 1600 | ~183 KB | 30.8 req/s |
+| 1800 x 2400 | ~332 KB | 15.6 req/s |
+
+**Capturing at 640x854 instead of 1800x2400 is ~2.4x throughput for free** — a
+third of the fleet, no accuracy change. The detector letterboxes to 512x512
+regardless and the recognizer works from a 112x112 crop, so a full-resolution
+phone capture spends its extra pixels on JPEG decode and nothing else.
+
+If the mobile client can be changed, do this before adding a single instance. It
+is the cheapest 2x available and it also cuts S3 egress and upload latency.
+
+`ML_SERVICE_FACE_MAX_INPUT_SIDE` caps the image *after* decode, so it protects
+the detector but not the decode itself — the saving has to happen at capture.
 
 ### Is 100 concurrent the real requirement?
 
@@ -220,6 +328,66 @@ done
 
 Throughput plateaus at the hardware ceiling and latency then grows linearly with
 concurrency. The last level that passes is the real capacity of that fleet.
+
+---
+
+## Storage: nothing should accumulate
+
+The verification path persists no images and no embeddings. Left at defaults,
+though, three things still grew on disk — and all three scale with request rate,
+so they are smallest exactly when you are testing and largest in production.
+
+| Source | At 1000 req/s | Now |
+|---|---|---|
+| API access log (one line per request) | ~13 GB/day | **off** (`ZEPIRIS_ACCESS_LOG=false`) |
+| ML access log (duplicate of the same request) | ~13 GB/day | **off** (`ML_SERVICE_ACCESS_LOG=false`) |
+| Threshold-calibration log (one JSON line per verification) | ~17 GB/day | **off** (`ZEPIRIS_LEARNING_ENABLED=false`) |
+| Multipart spooling images over 1 MB to temp files | ~2000 file writes/s | **removed** (framed body) |
+| Docker `json-file` driver | unbounded | capped at 30 MB/container |
+
+### The temp-file one was invisible
+
+Starlette's multipart parser spools any part over 1 MB to a real temporary
+**file**. Since a normal phone photo exceeds that, every such request wrote both
+images to disk and read them back — on a service whose entire design claim is
+that it persists nothing.
+
+`/v1/face/match` now takes both images in one framed binary body: a 4-byte
+big-endian length, the probe, then the reference (`zepiris/framing.py`). That
+keeps everything in memory and skips boundary scanning. Verified with a 5.91 MB
+payload — well over the 1 MB threshold — creating zero temp files.
+
+### Access logs
+
+Off by default on both services. At 10 req/s a line per request is free; at 1000
+it is 13 GB/day, and it duplicates what the load balancer already records with
+retention controls the instance disk does not have. The ALB is the request log.
+
+Startup lines still print (which tier loaded, the resolved concurrency limit,
+whether warm-up ran) — one-time, and the first thing you want when an instance
+misbehaves. `LOG_LEVEL=WARNING` silences even those.
+
+### Threshold calibration
+
+Off by default now. Beyond the volume, it is process-local: on an autoscaled
+fleet the file dies with the instance, so samples are never joined with the
+feedback that would calibrate anything. Turn it on only with a real destination
+— a shared volume or a datastore — and a retention policy.
+
+### Read-only containers
+
+Both containers run `read_only: true` with a 64 MB tmpfs on `/tmp`. Nothing is
+written at runtime, so anything that tries now fails at the point of the bug
+rather than quietly filling the disk over weeks. Verified: 200 requests created
+no files in the working tree, no learning directory, and left neither process
+holding a temp file open.
+
+> Not yet verified end to end in Docker — the container config above was written
+> without a running Docker daemon to test against. Run `docker compose up` once
+> and confirm both containers reach healthy before relying on it in production.
+
+40 GB gp3 per instance is then ample: the AMI, the images, and the model cache,
+with nothing growing underneath them.
 
 ---
 

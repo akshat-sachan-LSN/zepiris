@@ -43,4 +43,7 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=20s --start-period=15s --retries=3 \
     CMD curl -fsS http://127.0.0.1:8000/healthz || exit 1
 
-CMD ["python", "-m", "uvicorn", "zepiris.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Console script rather than a bare uvicorn line so ZEPIRIS_API_WORKERS is
+# honoured — a single worker caps this process at one core for the JSON/base64
+# work on the request path.
+CMD ["zepiris-api"]

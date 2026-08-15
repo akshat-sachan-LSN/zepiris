@@ -9,10 +9,29 @@ services:
       dockerfile: ml_inference.Dockerfile
     container_name: zepiris-ml-inference
     restart: always
+    # Nothing is written at runtime, so the filesystem is read-only and the two
+    # paths that need to be writable are memory-backed. Anything that tries to
+    # persist now fails loudly at the point of the bug rather than quietly
+    # filling the instance disk over weeks.
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    # Docker's json-file driver is UNBOUNDED by default: one container log can
+    # consume the whole volume. Cap it.
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
     environment:
       ML_SERVICE_HOST: "0.0.0.0"
       ML_SERVICE_PORT: "8001"
       ML_SERVICE_ML_DEVICE: "cpu"
+      # No per-request access log: this service sits behind the API on localhost,
+      # so each line duplicates a request the API and the ALB already recorded.
+      ML_SERVICE_ACCESS_LOG: "false"
+      # Startup/config lines only. Set to WARNING to quiet even those.
+      LOG_LEVEL: "INFO"
       # Weights are baked into the image at build time (ml_inference.Dockerfile COPY models/).
       ML_SERVICE_NSFW_MODEL_SOURCE: "auto"
       ML_SERVICE_NSFW_LOCAL_MODEL_PATH: "/app/models/nsfw_model.pth"
@@ -24,14 +43,34 @@ services:
       # default. "antelopev2" is more accurate but fails to load with this image's
       # InsightFace/onnxruntime build, so it falls back to buffalo_l anyway.
       ML_SERVICE_FACE_MODEL_NAME: "buffalo_l"
+      # Detector/recognizer pairing. "balanced" keeps buffalo_l's ResNet50
+      # recognition — the model that decides match scores — behind a much cheaper
+      # detector (~3x throughput, no measured accuracy cost). "fast" also swaps
+      # recognition for MobileFaceNet (~10x) but moves the embedding space, so
+      # recalibrate the threshold before switching. "accurate" = stock buffalo_l.
+      # See docs/PERFORMANCE.md.
+      ML_SERVICE_FACE_TIER: "balanced"
+      # One core per inference; parallelism comes from concurrent requests. Per-
+      # inference fan-out oversubscribes the CPU under load and collapses
+      # throughput — see docs/PERFORMANCE.md.
+      ML_SERVICE_FACE_INTRA_OP_THREADS: "1"
+      # Cap in-flight inferences (0 = CPU count - 1). Requests past the cap wait
+      # briefly, then get 503 instead of piling up past the caller's timeout.
+      ML_SERVICE_MAX_CONCURRENT_INFERENCES: "0"
+      ML_SERVICE_INFERENCE_QUEUE_TIMEOUT_SECONDS: "20"
+      # Downscale oversized captures before detection; the detector letterboxes
+      # to the detection size anyway, so a 12 MP frame only costs a bigger resize.
+      ML_SERVICE_FACE_MAX_INPUT_SIDE: "1600"
       # Detector confidence; 0.5 = cleanest crops/best scores. Lower (e.g. 0.3)
       # only if small/printed document faces are being missed.
       ML_SERVICE_FACE_DET_THRESH: "0.5"
       # Fallback detection for hard faces (documents): used only when the primary
       # pass finds nothing, then a lower threshold + an upscaled retry kick in.
-      ML_SERVICE_FACE_LOW_DET_THRESH: "0.05"
+      # Each retry is a full extra detection pass, so keep the upscale modest —
+      # 3.0 made every no-face image cost several times a normal request.
+      ML_SERVICE_FACE_LOW_DET_THRESH: "0.3"
       ML_SERVICE_FACE_ENABLE_UPSCALE_RETRY: "true"
-      ML_SERVICE_FACE_UPSCALE_FACTOR: "3.0"
+      ML_SERVICE_FACE_UPSCALE_FACTOR: "2.0"
     volumes:
       # Persist the InsightFace buffalo_l weights (~300MB) downloaded on first
       # startup, so container recreates don't re-download them every time.
@@ -51,13 +90,38 @@ services:
       dockerfile: Dockerfile
     container_name: zepiris-api
     restart: always
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
     environment:
+      # No per-request access log — roughly 13 GB/day at 1000 req/s, duplicating
+      # what the load balancer already records with real retention controls.
+      ZEPIRIS_ACCESS_LOG: "false"
+      LOG_LEVEL: "INFO"
+      # Threshold calibration appends a line per verification (~17 GB/day at
+      # 1000 req/s) to a process-local file that dies with the instance on an
+      # autoscaled fleet. Off unless it has a real destination and retention.
+      ZEPIRIS_LEARNING_ENABLED: "false"
       ZEPIRIS_API_TITLE: "ZepIris"
       ZEPIRIS_API_VERSION: "1.0.0"
       ZEPIRIS_VERIFY_THRESHOLD: "0.5"
       ZEPIRIS_DOC_MIN_SHARPNESS: "0"
-      # ML Inference service (main API encodes images to base64 and calls /v1/iqa/assess, /v1/face/embed)
+      # ML Inference service. The API forwards both images as raw bytes to
+      # /v1/face/match in a single call and gets back only the score.
       ZEPIRIS_ML_INFERENCE_SERVICE_URL: "http://ml-inference:8001"
+      # Connection pools must cover peak in-flight requests; httpx keeps only 20
+      # connections alive by default, so past that every request re-handshakes
+      # exactly when load is highest.
+      ZEPIRIS_ML_MAX_CONNECTIONS: "200"
+      ZEPIRIS_S3_MAX_CONNECTIONS: "200"
+      # The API is I/O-bound (fetch images, await the ML service), so a couple of
+      # workers saturate it; the CPU cost lives in the ML service.
+      ZEPIRIS_API_WORKERS: "2"
     ports:
       - "8000:8000"
     depends_on:

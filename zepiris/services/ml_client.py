@@ -25,6 +25,7 @@ from typing import Any
 
 import httpx
 
+from zepiris.framing import encode_pair_frame
 from zepiris.schemas.ml_inference import (
     BlurDetectionResult,
     FaceDetectionResult,
@@ -238,17 +239,17 @@ class AsyncMLInferenceClient:
         *,
         want_probe_sharpness: bool = False,
     ) -> FaceMatchResult:
-        """Score a 1:1 pair, sending both images as raw multipart bytes.
+        """Score a 1:1 pair, sending both images as one framed binary body.
 
         The images go over the wire exactly as they arrived — no base64, no
-        re-encode — and only the similarity comes back.
+        re-encode — and only the similarity comes back. Framing rather than
+        multipart keeps both sides in memory: multipart spools any part over 1 MB
+        to a temporary file, which a typical phone photo exceeds.
         """
         response = await self.client.post(
             "/v1/face/match",
-            files={
-                "probe": ("probe", probe, "application/octet-stream"),
-                "reference": ("reference", reference, "application/octet-stream"),
-            },
+            content=encode_pair_frame(probe, reference),
+            headers={"Content-Type": "application/octet-stream"},
             params={"want_probe_sharpness": str(want_probe_sharpness).lower()},
         )
         response.raise_for_status()

@@ -12,6 +12,7 @@ from zepiris.exceptions import (
     MLInferenceUpstreamError,
     ReferenceImageDecodeError,
 )
+from zepiris.framing import HEADER_SIZE, decode_pair_frame
 from zepiris.schemas.ml_inference import FaceEmbeddingResult
 from zepiris.services.matching import (
     LocalFaceMatcher,
@@ -129,14 +130,16 @@ def test_remote_sends_both_images_raw_in_one_call() -> None:
             },
         )
 
-    probe = _jpeg()
-    result = asyncio.run(_remote(handler).match(probe, _jpeg()))
+    probe, reference = _jpeg(), _jpeg()
+    result = asyncio.run(_remote(handler).match(probe, reference))
 
     assert result.score == pytest.approx(0.81)
     assert seen["count"] == 1
     assert "/v1/face/match" in seen["url"]
-    # The original JPEG bytes travel verbatim inside the multipart body.
-    assert probe in seen["body"]
+    # Both originals travel verbatim, and the body is exactly the two images plus
+    # the 4-byte length prefix — no encoding expansion, no multipart scaffolding.
+    assert decode_pair_frame(seen["body"]) == (probe, reference)
+    assert len(seen["body"]) == len(probe) + len(reference) + HEADER_SIZE
 
 
 def test_remote_maps_probe_decode_failure() -> None:
