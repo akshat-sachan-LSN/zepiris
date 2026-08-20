@@ -1,0 +1,43 @@
+# GPU overlay — apply on top of docker-compose.yml on an NVIDIA instance
+# (g4dn.xlarge / T4 and up):
+#
+#   docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d --build
+#
+# Requires on the host: NVIDIA driver (nvidia-smi works) and the NVIDIA container
+# toolkit (`docker run --rm --gpus all nvidia/cuda:12.4.0-base-ubuntu22.04
+# nvidia-smi` works). See docs/CPU_VS_GPU.md §5.
+name: zepiris
+
+services:
+  ml-inference:
+    build:
+      args:
+        # CUDA 12 / cuDNN 9 build of ONNX Runtime. 1.29+ moved to CUDA 13, which
+        # needs a 580-series driver; 1.23.2 runs on the 550/570 drivers the AL2023
+        # and Deep Learning AMIs ship. The [cuda,cudnn] extras bring the CUDA
+        # libraries as pip wheels, so no CUDA toolkit is needed in the image.
+        ONNXRUNTIME_GPU_VERSION: "1.23.2"
+    # The NVIDIA container runtime injects the host's driver libraries at startup
+    # and rewrites /etc/ld.so.cache to make them findable, which a read-only
+    # rootfs refuses. /tmp stays tmpfs, so nothing the service writes persists.
+    read_only: false
+    environment:
+      ML_SERVICE_ML_DEVICE: "cuda"
+      # The accurate tier is the reason to move to GPU: ResNet50 recognition is
+      # trivial work for a T4 and every existing threshold stays valid.
+      ML_SERVICE_FACE_TIER: "accurate"
+      # The default (0) means CPU count - 1 — three in-flight inferences on this
+      # 4-vCPU host, which would leave the card idle. A GPU host that plateaus for
+      # no visible reason is almost always this setting.
+      ML_SERVICE_MAX_CONCURRENT_INFERENCES: "32"
+      # Parallel pair embedding fans one request across CPU workers to hide CPU
+      # latency. On GPU both embeddings are already sub-10 ms and serialise on the
+      # card anyway, so the fan-out only burns host cores needed for JPEG decode.
+      ML_SERVICE_FACE_PARALLEL_PAIR_EMBED: "false"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
