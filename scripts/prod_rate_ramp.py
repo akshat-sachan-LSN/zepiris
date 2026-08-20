@@ -207,7 +207,7 @@ async def run(args: argparse.Namespace) -> int:
     every: list[dict] = []
     offset = 0
     async with httpx.AsyncClient(
-        limits=limits, timeout=httpx.Timeout(args.timeout, connect=10.0)
+        limits=limits, timeout=httpx.Timeout(args.timeout, connect=30.0)
     ) as client:
         for rate in rates:
             print(f"\n== {rate} req/s for {args.seconds}s ==")

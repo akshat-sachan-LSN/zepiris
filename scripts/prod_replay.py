@@ -124,7 +124,7 @@ async def _replay(events: list[dict], args: argparse.Namespace) -> list[dict]:
     results: list[dict] = []
 
     async with httpx.AsyncClient(
-        limits=limits, timeout=httpx.Timeout(args.timeout, connect=10.0)
+        limits=limits, timeout=httpx.Timeout(args.timeout, connect=30.0)
     ) as client:
 
         async def bounded(event: dict) -> None:

@@ -164,7 +164,9 @@ async def run(args: argparse.Namespace) -> int:
         max_connections=args.concurrency + 10,
         max_keepalive_connections=args.concurrency + 10,
     )
-    timeout = httpx.Timeout(args.timeout, connect=10.0)
+    # 30s to connect: a saturated instance accepts the socket late, and treating
+    # that as a failure would report a capacity limit as a transport error.
+    timeout = httpx.Timeout(args.timeout, connect=30.0)
 
     async with httpx.AsyncClient(limits=limits, timeout=timeout) as client:
         # Warm the models and the connection pool so the first requests are not

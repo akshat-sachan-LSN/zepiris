@@ -305,7 +305,7 @@ async def run(args: argparse.Namespace) -> int:
 
     pool = max(levels) + 20
     limits = httpx.Limits(max_connections=pool, max_keepalive_connections=pool)
-    timeout = httpx.Timeout(args.timeout, connect=10.0)
+    timeout = httpx.Timeout(args.timeout, connect=30.0)
 
     rows: list[dict] = []
     async with httpx.AsyncClient(limits=limits, timeout=timeout) as client:
