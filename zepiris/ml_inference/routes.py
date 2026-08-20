@@ -19,6 +19,7 @@ from zepiris.ml_inference.deps import (
     NSFWDep,
     SpoofDep,
 )
+from zepiris.ml_inference.embedding_cache import reference_digest
 from zepiris.schemas.ml_inference import (
     BlurDetectionResult,
     FaceDetectionResult,
@@ -128,8 +129,11 @@ def metrics(request: Request) -> dict:
     exist on this instance yet, which is exactly when another one is needed.
     """
     limiter = request.app.state.inference_limiter
+    service = getattr(request.app.state, "face_embedding_service", None)
+    cache = getattr(service, "reference_cache", None)
     return {
         "inference": limiter.snapshot(),
+        "reference_cache": cache.snapshot() if cache is not None else {"enabled": False},
         "ready": bool(getattr(request.app.state, "warmed_up", False)),
     }
 
@@ -165,23 +169,62 @@ async def match_faces(
 
     limiter = request.app.state.inference_limiter
     async with limiter.slot():
+        # Decided out here, where the limiter's occupancy is visible: embedding
+        # the two sides at once is only free while cores are idle.
+        parallel = _may_embed_in_parallel(request.app.state, limiter)
         return await run_in_threadpool(
             _match_sync,
             service,
             probe_raw,
             reference_raw,
             want_probe_sharpness,
+            parallel,
         )
 
 
+def _may_embed_in_parallel(state, limiter) -> bool:
+    """Whether this request may embed its two sides at once.
+
+    The test is not "is there a free slot" but "would doubling every in-flight
+    request still fit". Each parallel request occupies two cores instead of one,
+    so the safe condition is ``active * 2 <= limit``. A looser rule that only
+    asked for a couple of spare slots measurably backfired: at 5 concurrent
+    requests on 8 cores it let all five fan out to ten threads, and p50 went
+    *up* (564 ms -> 658 ms) because every request then fought for a core.
+
+    ``waiting == 0`` is the second guard — anything queued means the CPU is
+    already oversubscribed, whatever the active count says.
+    """
+    if not getattr(state, "parallel_pair_embed", False):
+        return False
+    if limiter.waiting:
+        return False
+    return limiter.active * 2 <= limiter.limit
+
+
 def _match_sync(
-    service, probe_raw: bytes, reference_raw: bytes, want_probe_sharpness: bool
+    service,
+    probe_raw: bytes,
+    reference_raw: bytes,
+    want_probe_sharpness: bool,
+    parallel: bool = False,
 ) -> FaceMatchResult:
-    """Decode + embed + score, off the event loop."""
+    """Decode + embed + score, off the event loop.
+
+    The reference is keyed by its own bytes before anything is decoded, so a
+    repeat verification against the same enrolled selfie skips that side's
+    embedding entirely — about half the work of a match.
+    """
+    cache = getattr(service, "reference_cache", None)
+    reference_key = reference_digest(reference_raw) if cache is not None and cache.enabled else None
     probe_rgb = _decode_image_bytes(probe_raw, field="probe")
     reference_rgb = _decode_image_bytes(reference_raw, field="reference")
     return service.match_pair(
-        probe_rgb, reference_rgb, want_probe_sharpness=want_probe_sharpness
+        probe_rgb,
+        reference_rgb,
+        want_probe_sharpness=want_probe_sharpness,
+        reference_key=reference_key,
+        parallel=parallel,
     )
 
 

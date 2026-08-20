@@ -8,6 +8,7 @@ import os
 import shutil
 import threading
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 
 import cv2
 import numpy as np
@@ -16,6 +17,10 @@ from insightface.app.common import Face
 from insightface.utils import face_align
 
 from zepiris.ml_inference.base import ModelService, ModelServiceConfig
+from zepiris.ml_inference.embedding_cache import (
+    ReferenceEmbedding,
+    ReferenceEmbeddingCache,
+)
 from zepiris.ml_inference.face_engine import DEFAULT_TIER, EngineConfig, build_engine
 from zepiris.schemas.ml_inference import (
     FaceDetectionResult,
@@ -56,6 +61,8 @@ class FaceEmbeddingService(ModelService):
         inter_op_threads: int = 1,
         max_input_side: int = 0,
         enable_det_cache: bool = False,
+        reference_cache_size: int = 0,
+        parallel_embed_workers: int = 4,
     ) -> None:
         """Initialize face embedding service.
 
@@ -115,6 +122,16 @@ class FaceEmbeddingService(ModelService):
                 which was true when the liveness gate ran before the embed. With
                 liveness off there is no second pass, so the cache is off by
                 default — hashing a multi-megapixel frame costs more than it saves.
+            reference_cache_size: Entries in the reference-embedding cache
+                (0 = off). The enrolled selfie is the same bytes on every
+                verification of that person, so its embedding — roughly half the
+                cost of a match — is recomputed for nothing. Keyed by image
+                content, so it cannot go stale. See
+                :mod:`zepiris.ml_inference.embedding_cache`.
+            parallel_embed_workers: Size of the helper pool used when a caller
+                asks for the two sides to be embedded concurrently. Only used on
+                a cache miss, and only when the caller knows there is spare CPU
+                — see ``match_pair(parallel=...)``.
         """
         self._embedding_dim = embedding_dim
         self._detection_size = detection_size
@@ -133,6 +150,10 @@ class FaceEmbeddingService(ModelService):
         self._intra_op_threads = intra_op_threads
         self._inter_op_threads = inter_op_threads
         self._max_input_side = max_input_side
+        self._reference_cache = ReferenceEmbeddingCache(reference_cache_size)
+        self._parallel_embed_workers = max(1, int(parallel_embed_workers))
+        self._embed_pool: ThreadPoolExecutor | None = None
+        self._pool_lock = threading.Lock()
         self._face_app: FaceAnalysis | None = None
         self._load_lock = threading.Lock()
         # The detector's confidence threshold is instance state on the shared
@@ -283,7 +304,9 @@ class FaceEmbeddingService(ModelService):
         if not self._enable_det_cache:
             return self._run_detect(app, image_rgb, det_thresh)
 
-        eff_thresh = det_thresh if det_thresh is not None else getattr(app.det_model, "det_thresh", None)
+        eff_thresh = (
+            det_thresh if det_thresh is not None else getattr(app.det_model, "det_thresh", None)
+        )
         digest = hashlib.blake2b(np.ascontiguousarray(image_rgb), digest_size=16).digest()
         key = b"%s|%r|%r" % (digest, eff_thresh, image_rgb.shape)
 
@@ -415,7 +438,9 @@ class FaceEmbeddingService(ModelService):
         if factor <= 1.0:
             return image_rgb
         return cv2.resize(
-            image_rgb, (int(round(w * factor)), int(round(h * factor))), interpolation=cv2.INTER_CUBIC
+            image_rgb,
+            (int(round(w * factor)), int(round(h * factor))),
+            interpolation=cv2.INTER_CUBIC,
         )
 
     def preprocess(self, image_rgb: np.ndarray) -> dict:
@@ -510,7 +535,9 @@ class FaceEmbeddingService(ModelService):
             # then average the embedding of the aligned crop and its horizontal mirror.
             # Summing here is fine — postprocess() L2-normalizes the result.
             aligned = face_align.norm_crop(image, landmark=face.kps, image_size=rec.input_size[0])
-            embedding = rec.get_feat(aligned).flatten() + rec.get_feat(cv2.flip(aligned, 1)).flatten()
+            embedding = (
+                rec.get_feat(aligned).flatten() + rec.get_feat(cv2.flip(aligned, 1)).flatten()
+            )
 
         det_score = float(getattr(face, "det_score", 0.0) or 0.0)
         # Only the document path reads sharpness; a face match would pay for a
@@ -601,38 +628,103 @@ class FaceEmbeddingService(ModelService):
         preprocessed["want_sharpness"] = want_sharpness
         return self.postprocess(self.predict(preprocessed))
 
+    @property
+    def reference_cache(self) -> ReferenceEmbeddingCache:
+        """The reference-embedding cache, for keying at the call site and /metrics."""
+        return self._reference_cache
+
+    def _pool(self) -> ThreadPoolExecutor:
+        """Helper threads for concurrent embedding, created on first use.
+
+        Built lazily so a deployment that never asks for parallel embedding never
+        carries the threads. ONNX Runtime releases the GIL for the duration of a
+        Run call, so these threads genuinely execute on separate cores.
+        """
+        if self._embed_pool is None:
+            with self._pool_lock:
+                if self._embed_pool is None:
+                    self._embed_pool = ThreadPoolExecutor(
+                        max_workers=self._parallel_embed_workers,
+                        thread_name_prefix="ref-embed",
+                    )
+        return self._embed_pool
+
+    def embed_reference(self, reference_rgb: np.ndarray) -> ReferenceEmbedding:
+        """Embed the reference side into a cacheable value."""
+        vector, found, det_score = self.embed_vector(reference_rgb)
+        if not found:
+            return ReferenceEmbedding(vector=None, face_detected=False)
+        return ReferenceEmbedding(vector=vector, face_detected=True, det_score=det_score)
+
     def match_pair(
         self,
         probe_rgb: np.ndarray,
         reference_rgb: np.ndarray,
         *,
         want_probe_sharpness: bool = False,
+        reference_key: str | None = None,
+        parallel: bool = False,
     ) -> FaceMatchResult:
         """Embed both sides and score them, all within this process.
 
         Doing the comparison here rather than in the caller keeps two 512-float
-        vectors off the wire and out of JSON on the hot path. The sides are
-        embedded sequentially on purpose: under real concurrency every core is
-        already busy with other requests, so splitting one request across threads
-        adds contention without adding throughput.
+        vectors off the wire and out of JSON on the hot path.
 
-        A probe with no detectable face short-circuits — there is nothing to
+        ``reference_key`` — a digest of the reference *bytes* from
+        :func:`~zepiris.ml_inference.embedding_cache.reference_digest` — turns the
+        reference side into a cache lookup. The enrolled selfie does not change
+        between verifications, so on a hit this method does half the work: one
+        embed instead of two. Pass None to bypass the cache.
+
+        ``parallel`` embeds the two sides concurrently instead of one after the
+        other, which roughly halves the latency of a cache miss (measured 349 ms
+        -> 177 ms on 8 cores). It is opt-in per call, and the caller is expected
+        to ask only when there is spare CPU: at high concurrency every core is
+        already busy with other requests, so splitting one request across threads
+        buys latency for one caller by taking throughput from everyone. It also
+        gives up the no-face short-circuit below — the reference is embedded
+        before the probe's verdict is known — which is free only while cores are
+        idle.
+
+        A probe with no detectable face short-circuits: there is nothing to
         compare it against, so the reference is never embedded.
         """
-        probe_pre = self.preprocess(probe_rgb)
-        probe_pre["want_sharpness"] = want_probe_sharpness
-        probe_vec, probe_found, probe_det, probe_sharp = self.predict(probe_pre)
+        cached = self._reference_cache.get(reference_key)
 
-        if not probe_found:
-            return FaceMatchResult(
-                score=None,
-                probe_face_detected=False,
-                reference_face_detected=False,
-                probe_face_sharpness=probe_sharp,
+        if cached is None and parallel:
+            # Start the reference before the probe's verdict is known: with idle
+            # cores that overlap is free, and it is the only way the two embeds
+            # can run at once.
+            pending = self._pool().submit(self.embed_reference, reference_rgb)
+            probe_vec, probe_found, probe_det, probe_sharp = self._embed_probe(
+                probe_rgb, want_probe_sharpness
             )
+            reference = pending.result()
+            self._reference_cache.put(reference_key, reference)
+            if not probe_found:
+                return FaceMatchResult(
+                    score=None,
+                    probe_face_detected=False,
+                    reference_face_detected=False,
+                    probe_face_sharpness=probe_sharp,
+                )
+        else:
+            probe_vec, probe_found, probe_det, probe_sharp = self._embed_probe(
+                probe_rgb, want_probe_sharpness
+            )
+            if not probe_found:
+                return FaceMatchResult(
+                    score=None,
+                    probe_face_detected=False,
+                    reference_face_detected=False,
+                    probe_face_sharpness=probe_sharp,
+                )
+            reference = cached
+            if reference is None:
+                reference = self.embed_reference(reference_rgb)
+                self._reference_cache.put(reference_key, reference)
 
-        ref_vec, ref_found, ref_det = self.embed_vector(reference_rgb)
-        if not ref_found:
+        if not reference.face_detected:
             return FaceMatchResult(
                 score=None,
                 probe_face_detected=True,
@@ -646,13 +738,21 @@ class FaceEmbeddingService(ModelService):
             probe_vec = probe_vec / probe_norm
 
         return FaceMatchResult(
-            score=float(np.dot(probe_vec, ref_vec)),
+            score=float(np.dot(probe_vec, reference.vector)),
             probe_face_detected=True,
             reference_face_detected=True,
             probe_det_score=probe_det,
-            reference_det_score=ref_det,
+            reference_det_score=reference.det_score,
             probe_face_sharpness=probe_sharp,
         )
+
+    def _embed_probe(
+        self, probe_rgb: np.ndarray, want_sharpness: bool
+    ) -> tuple[np.ndarray, bool, float | None, float | None]:
+        """Detect and embed the probe side, keeping its sharpness if asked for."""
+        preprocessed = self.preprocess(probe_rgb)
+        preprocessed["want_sharpness"] = want_sharpness
+        return self.predict(preprocessed)
 
     def embed_vector(self, image_rgb: np.ndarray) -> tuple[np.ndarray, bool, float | None]:
         """Embed and return the raw vector, skipping the JSON-facing result model.

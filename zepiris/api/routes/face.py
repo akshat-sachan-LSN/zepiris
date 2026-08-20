@@ -5,9 +5,17 @@ import base64
 import binascii
 import uuid
 
-from fastapi import APIRouter, Form
+import cv2
+import numpy as np
+from fastapi import APIRouter, File, Form, UploadFile
 
-from zepiris.deps import LearnerDep, MatcherDep, S3FetcherDep, SettingsDep
+from zepiris.deps import (
+    EmbeddingDep,
+    LearnerDep,
+    MatcherDep,
+    S3FetcherDep,
+    SettingsDep,
+)
 from zepiris.exceptions import (
     DocumentTooBlurryError,
     EmptyUploadError,
@@ -413,3 +421,28 @@ async def verify_face(
         fetcher=fetcher,
         learner=learner,
     )
+
+
+@router.post("/detect")
+async def detect_face(
+    embedding_svc: EmbeddingDep,
+    file: UploadFile = File(...),
+) -> dict:
+    """Cheap face-present check: is a face visible, and where?
+
+    Deliberately never raises on a bad frame — callers poll this, and a poll that
+    500s on an unreadable frame is harder to use than one that says "no face".
+    """
+    raw = await file.read()
+    if not raw:
+        return {"faceDetected": False, "bbox": [0, 0, 0, 0]}
+    arr = np.frombuffer(raw, dtype=np.uint8)
+    image_bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if image_bgr is None:
+        return {"faceDetected": False, "bbox": [0, 0, 0, 0]}
+    image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+    try:
+        result = embedding_svc.detect_box(image_rgb)
+    except Exception:
+        return {"faceDetected": False, "bbox": [0, 0, 0, 0]}
+    return {"faceDetected": bool(result.face_detected), "bbox": result.bbox}

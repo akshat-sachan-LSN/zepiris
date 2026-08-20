@@ -27,7 +27,7 @@ from your S3 URLs at request time.
 | Port | Source                | Purpose                                   |
 |------|-----------------------|-------------------------------------------|
 | 22   | your IP               | SSH                                       |
-| 8000 | your app / ALB / your IP | ZepIris API + `/ui`                    |
+| 8000 | your app / ALB / your IP | ZepIris API                            |
 | 8001 | **none** (leave closed) | ML service — internal to the box only   |
 
 > The API talks to the ML service over the Docker network, so 8001 never needs
@@ -114,24 +114,23 @@ Each side accepts **base64 or an S3 URL**. See `docs/API_REFERENCE.md`.
 
 ---
 
-## 5. The browser UI (`/ui`) needs HTTPS
+## 5. HTTPS in front of the API (optional)
 
-The camera capture in `/ui` only works on `localhost` **or** over HTTPS — browsers
-block `getUserMedia` on plain `http://<public-ip>`. Options:
+The service speaks plain HTTP on 8000. That is fine when the caller is your own
+backend inside the VPC. Terminate TLS when the caller is outside it:
 
-- **Just call the API** (`/v1/faces/verify`) from your own app — no HTTPS needed
-  for server-to-server calls. The `/ui` page is a demo/test tool.
-- **If you need `/ui` remotely:** put an HTTPS reverse proxy in front. Quickest is
-  Caddy (auto Let's Encrypt) on the same box:
+- **ALB / API Gateway** — the usual answer if you already run one; point it at
+  8000 and keep the security group closed to everything else.
+- **Caddy on the same box** — quickest for a single instance (auto Let's Encrypt):
 
   ```bash
   # /etc/caddy/Caddyfile
-  verify.yourdomain.com {
+  api.yourdomain.com {
       reverse_proxy 127.0.0.1:8000
   }
   ```
   Point a DNS A record at the EC2 IP, open 80/443 in the security group, and Caddy
-  provisions a cert automatically. Then open `https://verify.yourdomain.com/ui`.
+  provisions a cert automatically.
 
 ---
 

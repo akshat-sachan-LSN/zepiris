@@ -90,7 +90,6 @@ ZepIris consists of **two independent FastAPI microservices** that communicate v
       │  Main API (port 8000)                 │
       │  ├─ POST /v1/faces/verify             │
       │  ├─ POST /v1/faces/detect             │
-      │  ├─ GET  /ui  (single verify page)    │
       │  ├─ GET  /healthz                     │
       │  └─ GET  /readyz                      │
       └───┬───────────────────────────┬───────┘
@@ -179,8 +178,7 @@ docker compose up -d --build
 docker compose logs -f ml-inference     # Ctrl+C when "Application startup complete"
 curl http://localhost:8000/healthz       # {"status":"ok"}
 
-# 4. Open the UI / docs
-#    UI:    http://localhost:8000/ui
+# 4. Open the API docs
 #    Docs:  http://localhost:8000/docs
 
 # Stop
@@ -207,7 +205,7 @@ poetry install --extras ml
 # 3. Run BOTH services with one script (starts ml-inference, waits, starts api)
 chmod +x run_local.sh
 ./run_local.sh
-#    UI:  http://localhost:8000/ui   ·   stop with Ctrl+C (kills both)
+#    API: http://localhost:8000/docs   ·   stop with Ctrl+C (kills both)
 ```
 
 `run_local.sh` points the model paths at the local `./models/` directory and wires
@@ -227,7 +225,7 @@ make run-api-local
 ```bash
 # --- Launch an instance ---
 # Ubuntu 22.04 LTS · t3.large (8 GB RAM) min · 30–40 GB gp3 root disk · public IP
-# Security Group inbound: 22 (your IP), 8000 (API/UI). Leave 8001 closed (internal).
+# Security Group inbound: 22 (your IP), 8000 (API). Leave 8001 closed (internal).
 
 # --- 1. Install Docker + Compose plugin ---
 sudo apt-get update && sudo apt-get install -y ca-certificates curl git
@@ -263,8 +261,6 @@ curl http://localhost:8000/healthz      # {"status":"ok"}
 - **Disk too small** — the default 8 GB root volume can't fit PyTorch. Use **30–40 GB**;
   if you hit `No space left on device`, resize the EBS volume then
   `sudo growpart /dev/nvme0n1 1 && sudo resize2fs /dev/nvme0n1p1`.
-- **`/ui` camera** needs HTTPS — over plain `http://<ip>` use file upload (the default),
-  or put Caddy/HTTPS in front. Server-to-server API calls don't need HTTPS.
 - **InsightFace permission error** — the `insightface_cache` volume is created
   root-owned on older deploys; if the ML log shows `Permission denied: .../.insightface`,
   run `docker compose exec -u root ml-inference chown -R appuser:appuser /home/appuser/.insightface`
@@ -358,9 +354,9 @@ curl -X POST http://localhost:8000/v1/faces/docmatch/verify \
 
 See [docs/API_REFERENCE.md](docs/API_REFERENCE.md) for every early-exit and error variant.
 
-#### Detect a Face (UI poll)
+#### Detect a Face
 
-Lightweight face-presence check used by the verify UI capture ring:
+Lightweight face-presence check — is a face visible, and where:
 
 ```bash
 curl -X POST http://localhost:8000/v1/faces/detect \
@@ -375,10 +371,6 @@ curl -X POST http://localhost:8000/v1/faces/detect \
   "faceDetected": true
 }
 ```
-
-#### Verify UI
-
-A single-page verify UI is served at [http://localhost:8000/ui](http://localhost:8000/ui).
 
 ### ML Inference API (`/v1/`)
 

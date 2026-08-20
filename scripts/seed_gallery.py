@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Enroll a gallery of face images into ZepIris (for the /ui verify demo).
+"""Enroll a gallery of face images into ZepIris.
 
 Each image becomes one enrolled person whose name is the file's stem:
     gallery/alice.jpg   -> person "alice"
@@ -124,8 +124,6 @@ def main() -> int:
             failures += 1
 
     print(f"\nDone. Enrolled {enrolled}, failed {failures}.")
-    if enrolled:
-        print(f"Open the verify UI:  {args.api.rstrip('/')}/ui")
     return 0 if failures == 0 else 2
 
 

@@ -41,4 +41,4 @@ echo
 echo "✓ Setup complete."
 echo "  Start everything:  ./scripts/run_all.sh"
 echo "  Seed the gallery:  .venv/bin/python scripts/seed_gallery.py"
-echo "  Open the UI:       http://localhost:8000/ui"
+echo "  API docs:          http://localhost:8000/docs"

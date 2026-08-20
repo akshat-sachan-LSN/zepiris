@@ -32,5 +32,5 @@ export ZEPIRIS_MILVUS_PORT="${ZEPIRIS_MILVUS_PORT:-19530}"
 export ZEPIRIS_MILVUS_COLLECTION="${ZEPIRIS_MILVUS_COLLECTION:-zepiris_faces}"
 export ZEPIRIS_MILVUS_EMBEDDING_DIM="${ZEPIRIS_MILVUS_EMBEDDING_DIM:-512}"
 
-echo "Starting API on http://localhost:8000  (UI: http://localhost:8000/ui)"
+echo "Starting API on http://localhost:8000  (docs: http://localhost:8000/docs)"
 exec "$ROOT/.venv/bin/zepiris-api"

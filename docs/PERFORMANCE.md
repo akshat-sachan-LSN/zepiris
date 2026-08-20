@@ -107,6 +107,63 @@ the API path from 34 to 44 req/s at 100 concurrent.
 
 ---
 
+## Not embedding the reference twice
+
+Recognition is 88% of a match: on a 1200x1600 capture, `balanced` on one core
+spends ~19 ms detecting and ~164 ms embedding, per side. Halving the *work* is
+therefore worth far more than shaving the parts around it.
+
+Half of it is avoidable. The probe is a fresh capture — new pixels, nothing to
+reuse. The reference is the enrolled selfie, and it is the same bytes on every
+verification of that person, so its embedding is recomputed to produce a vector
+that cannot have changed. `ML_SERVICE_FACE_REFERENCE_CACHE_SIZE` keeps those
+vectors, keyed by a digest of the image bytes:
+
+| | latency | note |
+|---|---|---|
+| both sides embedded | ~350 ms | what every request used to pay |
+| reference cached | ~183 ms | one embed instead of two |
+
+Keying on content rather than on a user id or an S3 URL is what makes this safe
+to leave on. Different bytes are a different key, identical bytes through the
+same model are an identical embedding, and the cache dies with the process — so
+there is no TTL to tune, no invalidation to get wrong, and no way to serve a
+vector belonging to a re-enrolled photo. A reference with no detectable face is
+cached too, so a caller retrying against an unusable enrolled image stops paying
+full detection each time.
+
+The hit rate is the number to watch, on `/metrics` under `reference_cache`. It is
+a property of the traffic, not the service: a population verifying repeatedly
+against stable enrolments approaches 1.0, while genuinely first-time
+verifications never hit and the ~8 MB buys nothing.
+
+### Embedding the two sides at once
+
+On a cache miss there are still two embeds, and they do not have to be
+sequential — ONNX Runtime releases the GIL, so two threads genuinely use two
+cores (measured 349 ms -> 177 ms). The catch is that this is only free while
+cores are idle: at high concurrency every core already has a request on it, and
+fanning one request across two takes throughput from everyone to help one
+caller. So `ML_SERVICE_FACE_PARALLEL_PAIR_EMBED` is decided per request against
+the limiter's occupancy, and the condition is that doubling *all* in-flight work
+would still fit (`active * 2 <= limit`), not merely that a slot is free. A looser
+rule backfired measurably: at 5 concurrent requests on 8 cores it let all five
+fan out to ten threads and p50 rose from 564 ms to 658 ms.
+
+Measured back to back on one 8-core machine, 20 enrolled references, every probe
+unique, both features off then on:
+
+| Concurrent users | p50 off | p50 on | req/s off | req/s on | shed off | shed on |
+|---|---|---|---|---|---|---|
+| 5 | 572 ms | 364 ms | 8.6 | 10.4 | 0 | 0 |
+| 10 | 843 ms | 629 ms | 9.8 | 15.0 | 0 | 0 |
+| 20 | 2239 ms | 1544 ms | 8.4 | 12.6 | 0 | 0 |
+| 100 | 19200 ms | 14502 ms | 4.8 | 6.3 | 2 | 0 |
+| 200 | 19425 ms | 17628 ms | 5.5 | 10.5 | 105 | 0 |
+
+Neither changes a score. Both were checked against the uncached, sequential path
+on real images and agreed to the bit.
+
 ## Choosing a tier
 
 `ML_SERVICE_FACE_TIER` selects the detector/recognizer pairing.

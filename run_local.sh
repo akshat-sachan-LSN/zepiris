@@ -3,7 +3,7 @@
 # run_local.sh — start BOTH ZepIris services locally with Poetry (no Docker).
 #
 #   1. ml-inference  (PyTorch models)  ->  http://127.0.0.1:8001
-#   2. api           (FastAPI + /ui)   ->  http://127.0.0.1:8000
+#   2. api           (FastAPI backend) ->  http://127.0.0.1:8000
 #
 # The ML service starts first; the API waits until it is healthy, then starts.
 # Press Ctrl+C once to stop BOTH services cleanly.
@@ -91,7 +91,6 @@ done
 echo ""
 echo "================================================================"
 echo "  ZepIris is running:"
-echo "    UI:   http://127.0.0.1:${API_PORT}/ui"
 echo "    API:  http://127.0.0.1:${API_PORT}/v1/faces/verify"
 echo "    ML:   http://127.0.0.1:${ML_PORT}/healthz"
 echo ""

@@ -4,7 +4,7 @@
 #   2. ML inference service (:8001) in the background  -> logs/ml.log
 #   3. API (:8000) in the foreground  (Ctrl+C to stop everything)
 #
-# Open the UI at http://localhost:8000/ui
+# Backend only — no UI is served. Check health at http://localhost:8000/healthz
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -35,5 +35,5 @@ echo "▶ Waiting for ML service health…"
 until curl -sf http://localhost:8001/healthz >/dev/null 2>&1; do sleep 2; done
 echo "  ML ready (logs/ml.log)."
 
-echo "▶ [3/3] Starting API (:8000).  UI → http://localhost:8000/ui   (Ctrl+C to stop)"
+echo "▶ [3/3] Starting API (:8000).  Docs → http://localhost:8000/docs   (Ctrl+C to stop)"
 "$ROOT/scripts/run_api.sh"
