@@ -17,6 +17,31 @@ services:
         # and Deep Learning AMIs ship. The [cuda,cudnn] extras bring the CUDA
         # libraries as pip wheels, so no CUDA toolkit is needed in the image.
         ONNXRUNTIME_GPU_VERSION: "1.23.2"
+    # Multiple worker processes, because one is not enough — and on GPU the
+    # reason is the host, not the card.
+    #
+    # Measured on g4dn.xlarge (4 vCPU, T4): a single ML process plateaus at ~190%
+    # CPU and ~34.5 req/s while the T4 draws 27 W of 70 W. That 190% is the GIL:
+    # one core running Python, plus roughly one more from OpenCV and ONNX Runtime
+    # releasing it during native work. Per-request cost on GPU is almost all
+    # CPU-side — JPEG decode, resize, letterbox, normalize, crop — so the limit is
+    # Python throughput, not inference. A bigger instance cannot fix that; one
+    # process cannot use more cores. More processes can.
+    #
+    # 3 on a 4-vCPU host leaves a core for the API and the event loops. Each
+    # worker loads its own copy of the models into GPU memory (~1.4 GB), so 3 is
+    # ~4.2 GB of the T4's 15 GB — and each warms up at startup, so boot is slower.
+    command:
+      - python
+      - -m
+      - uvicorn
+      - zepiris.ml_inference.app:app
+      - --host
+      - "0.0.0.0"
+      - --port
+      - "8001"
+      - --workers
+      - "3"
     # The NVIDIA container runtime injects the host's driver libraries at startup
     # and rewrites /etc/ld.so.cache to make them findable, which a read-only
     # rootfs refuses. /tmp stays tmpfs, so nothing the service writes persists.
@@ -26,13 +51,26 @@ services:
       # The accurate tier is the reason to move to GPU: ResNet50 recognition is
       # trivial work for a T4 and every existing threshold stays valid.
       ML_SERVICE_FACE_TIER: "accurate"
-      # The default (0) means CPU count - 1 — three in-flight inferences on this
-      # 4-vCPU host, which would leave the card idle. A GPU host that plateaus for
-      # no visible reason is almost always this setting.
-      ML_SERVICE_MAX_CONCURRENT_INFERENCES: "32"
-      # Parallel pair embedding fans one request across CPU workers to hide CPU
-      # latency. On GPU both embeddings are already sub-10 ms and serialise on the
-      # card anyway, so the fan-out only burns host cores needed for JPEG decode.
+      # Per worker, so with 3 workers the instance runs ~36 inferences at once.
+      # This is a queue-depth control, not a throughput knob: concurrency past
+      # what the hardware can actually retire adds only waiting. At the measured
+      # ~35 req/s and ~1s service time, useful in-flight work is ~35 requests
+      # (Little's law) — 36 covers it, while the old 32-per-worker meant 96 in
+      # flight, of which ~60 would have been queueing inside the process and
+      # making every other request slower through CPU contention.
+      ML_SERVICE_MAX_CONCURRENT_INFERENCES: "12"
+      # 30s: serve late rather than fail fast. The cost shows up in the measured
+      # ramp — at 200 req/s offered, requests came back at up to 27.6s and nothing
+      # was shed, because a slot always freed before the timeout did. So size the
+      # fleet from the rate where p95 stays inside the caller's deadline, not from
+      # the rate this will absorb; it absorbs far more than anyone is still
+      # waiting for. The API's own budget (ZEPIRIS_ML_INFERENCE_TIMEOUT_SECONDS,
+      # 60s) must stay above this, or the API gives up before the ML service sheds.
+      ML_SERVICE_INFERENCE_QUEUE_TIMEOUT_SECONDS: "30"
+      # Parallel pair embedding fans one request's two sides across CPU workers.
+      # Off here: with 3 GIL-bound worker processes already competing for 4 cores,
+      # fanning out inside a request steals throughput from other requests to
+      # help one. Worth re-testing once the process count is settled.
       ML_SERVICE_FACE_PARALLEL_PAIR_EMBED: "false"
     deploy:
       resources:
