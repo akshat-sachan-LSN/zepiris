@@ -41,6 +41,23 @@ RUN apt-get update \
     && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/*
 
+# GPU builds: swap the CPU wheel for onnxruntime-gpu plus the CUDA 12 / cuDNN 9
+# libraries it links against (the [cuda,cudnn] extras pull them from PyPI, so the
+# base image needs no CUDA toolkit — only the host driver, via the NVIDIA
+# container runtime). Empty, the default, leaves the CPU wheel alone.
+#
+# The CPU wheel has no CUDAExecutionProvider, so a GPU instance built without
+# this silently runs inference on the host cores. See docs/CPU_VS_GPU.md §5.2.
+ARG ONNXRUNTIME_GPU_VERSION=""
+RUN if [ -n "$ONNXRUNTIME_GPU_VERSION" ]; then \
+        pip uninstall -y onnxruntime \
+        && pip install --no-cache-dir \
+            "onnxruntime-gpu[cuda,cudnn]==${ONNXRUNTIME_GPU_VERSION}" \
+        && find /usr/local/lib/python3.12/site-packages/nvidia -type d -name lib \
+            > /etc/ld.so.conf.d/nvidia-pip-wheels.conf \
+        && ldconfig; \
+    fi
+
 COPY models/ /app/models/
 
 RUN useradd --uid 1000 --create-home --shell /usr/sbin/nologin appuser \
