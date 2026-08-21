@@ -8,6 +8,7 @@ import os
 import shutil
 import threading
 from collections import OrderedDict
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 
 import cv2
@@ -29,6 +30,24 @@ from zepiris.schemas.ml_inference import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_reference(
+    reference: np.ndarray | Callable[[], np.ndarray] | None,
+) -> np.ndarray:
+    """Materialize a reference image that may have been supplied lazily.
+
+    The match route passes a callable so the reference is decoded only when it is
+    actually needed — a cache hit never decodes those bytes at all. Resolving
+    here rather than at the call site means the decode happens on whichever
+    thread does the embedding, so the parallel path overlaps it with the probe.
+    """
+    if reference is None:
+        raise ValueError(
+            "a reference image is required on a cache miss; pass an array or a "
+            "callable that decodes one"
+        )
+    return reference() if callable(reference) else reference
 
 
 class FaceEmbeddingService(ModelService):
@@ -63,6 +82,8 @@ class FaceEmbeddingService(ModelService):
         enable_det_cache: bool = False,
         reference_cache_size: int = 0,
         parallel_embed_workers: int = 4,
+        det_model_path: str | None = None,
+        rec_model_path: str | None = None,
     ) -> None:
         """Initialize face embedding service.
 
@@ -132,6 +153,12 @@ class FaceEmbeddingService(ModelService):
                 asks for the two sides to be embedded concurrently. Only used on
                 a cache miss, and only when the caller knows there is spare CPU
                 — see ``match_pair(parallel=...)``.
+            det_model_path: Explicit path to a detector ``.onnx`` file. When set
+                together with ``rec_model_path`` it overrides the tier's default
+                detector, allowing FP16-converted models to be dropped in without
+                changing the tier. Both must be provided or neither takes effect.
+            rec_model_path: Explicit path to a recognizer ``.onnx`` file. See
+                ``det_model_path``.
         """
         self._embedding_dim = embedding_dim
         self._detection_size = detection_size
@@ -152,6 +179,8 @@ class FaceEmbeddingService(ModelService):
         self._max_input_side = max_input_side
         self._reference_cache = ReferenceEmbeddingCache(reference_cache_size)
         self._parallel_embed_workers = max(1, int(parallel_embed_workers))
+        self._det_model_path = det_model_path or None
+        self._rec_model_path = rec_model_path or None
         self._embed_pool: ThreadPoolExecutor | None = None
         self._pool_lock = threading.Lock()
         self._face_app: FaceAnalysis | None = None
@@ -204,6 +233,8 @@ class FaceEmbeddingService(ModelService):
                         intra_op_threads=self._intra_op_threads,
                         inter_op_threads=self._inter_op_threads,
                         device=self.config.device,
+                        det_model_path=self._det_model_path,
+                        rec_model_path=self._rec_model_path,
                     )
                 )
                 return self._face_app
@@ -659,7 +690,7 @@ class FaceEmbeddingService(ModelService):
     def match_pair(
         self,
         probe_rgb: np.ndarray,
-        reference_rgb: np.ndarray,
+        reference_rgb: np.ndarray | Callable[[], np.ndarray] | None,
         *,
         want_probe_sharpness: bool = False,
         reference_key: str | None = None,
@@ -675,6 +706,14 @@ class FaceEmbeddingService(ModelService):
         reference side into a cache lookup. The enrolled selfie does not change
         between verifications, so on a hit this method does half the work: one
         embed instead of two. Pass None to bypass the cache.
+
+        ``reference_rgb`` accepts either a decoded array or a **callable that
+        returns one**. The callable form is what the match route passes, so the
+        reference bytes are decoded only on a miss — on a hit that decode (a full
+        JPEG, several milliseconds) never happens. It has to be a callable rather
+        than the caller peeking at the cache first: between a peek and this
+        method's own lookup the entry can be evicted, and a caller that had
+        already decided not to decode would then have nothing to embed.
 
         ``parallel`` embeds the two sides concurrently instead of one after the
         other, which roughly halves the latency of a cache miss (measured 349 ms
@@ -695,7 +734,9 @@ class FaceEmbeddingService(ModelService):
             # Start the reference before the probe's verdict is known: with idle
             # cores that overlap is free, and it is the only way the two embeds
             # can run at once.
-            pending = self._pool().submit(self.embed_reference, reference_rgb)
+            pending = self._pool().submit(
+                lambda: self.embed_reference(_resolve_reference(reference_rgb))
+            )
             probe_vec, probe_found, probe_det, probe_sharp = self._embed_probe(
                 probe_rgb, want_probe_sharpness
             )
@@ -721,7 +762,7 @@ class FaceEmbeddingService(ModelService):
                 )
             reference = cached
             if reference is None:
-                reference = self.embed_reference(reference_rgb)
+                reference = self.embed_reference(_resolve_reference(reference_rgb))
                 self._reference_cache.put(reference_key, reference)
 
         if not reference.face_detected:

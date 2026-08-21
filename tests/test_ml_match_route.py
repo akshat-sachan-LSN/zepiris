@@ -10,6 +10,7 @@ from zepiris.framing import encode_pair_frame
 from zepiris.ml_inference.concurrency import InferenceLimiter
 from zepiris.ml_inference.deps import FaceEmbeddingDep
 from zepiris.ml_inference.embedding_cache import (
+    ReferenceEmbedding,
     ReferenceEmbeddingCache,
     reference_digest,
 )
@@ -23,10 +24,25 @@ def _jpeg() -> bytes:
     return buf.tobytes()
 
 
+def _embedding() -> ReferenceEmbedding:
+    return ReferenceEmbedding(
+        vector=np.zeros(512, dtype=np.float32), face_detected=True, det_score=0.9
+    )
+
+
 class _Service:
+    """Stands in for FaceEmbeddingService, mirroring how it treats the reference.
+
+    The route hands the reference over as a **callable** so a cache hit never
+    decodes those bytes. That only holds if the service resolves it lazily, so
+    this fake resolves it exactly where the real one does — on a cache miss — and
+    counts the resolutions, which is what the laziness test asserts on.
+    """
+
     def __init__(self, result: FaceMatchResult, *, cache_size: int = 0) -> None:
         self._result = result
         self.calls: list[dict] = []
+        self.resolved = 0
         self.reference_cache = ReferenceEmbeddingCache(max_entries=cache_size)
 
     def match_pair(
@@ -38,10 +54,16 @@ class _Service:
         reference_key=None,
         parallel=False,
     ):
+        if self.reference_cache.get(reference_key) is None:
+            reference = reference_rgb() if callable(reference_rgb) else reference_rgb
+            self.resolved += 1
+            self.reference_cache.put(reference_key, _embedding())
+        else:
+            reference = None
         self.calls.append(
             {
                 "probe_shape": probe_rgb.shape,
-                "reference_shape": reference_rgb.shape,
+                "reference_shape": None if reference is None else reference.shape,
                 "want_probe_sharpness": want_probe_sharpness,
                 "reference_key": reference_key,
                 "parallel": parallel,
@@ -274,3 +296,43 @@ def test_gate_is_off_when_the_setting_is_off() -> None:
     limiter = InferenceLimiter(limit=8, queue_timeout=1.0)
     limiter._active = 1
     assert _may_embed_in_parallel(_Off(), limiter) is False
+
+
+def test_a_cached_reference_is_never_decoded() -> None:
+    """The saving is the decode, not just the embed.
+
+    The reference of a repeat verification is the same bytes every time, so once
+    its embedding is cached there is nothing to learn from decoding the JPEG
+    again — several milliseconds of CPU per request, on the majority of requests.
+    """
+    service = _Service(
+        FaceMatchResult(score=0.5, probe_face_detected=True, reference_face_detected=True),
+        cache_size=16,
+    )
+    client = _client(service)
+    ref = _jpeg()
+    _post(client, reference=ref)
+    _post(client, reference=ref)
+    assert service.resolved == 1
+    assert service.calls[0]["reference_shape"] == (64, 64, 3)
+    assert service.calls[1]["reference_shape"] is None
+
+
+def test_the_reference_is_handed_over_lazily() -> None:
+    """A callable, not an array — peeking the cache in the route would race.
+
+    An entry can be evicted between a peek and the service's own lookup, and a
+    caller that had already decided not to decode would have nothing to embed.
+    """
+    captured: list[object] = []
+
+    class _Capture(_Service):
+        def match_pair(self, probe_rgb, reference_rgb, **kw):
+            captured.append(reference_rgb)
+            return super().match_pair(probe_rgb, reference_rgb, **kw)
+
+    service = _Capture(
+        FaceMatchResult(score=0.5, probe_face_detected=True, reference_face_detected=True)
+    )
+    assert _post(_client(service)).status_code == 200
+    assert callable(captured[0])

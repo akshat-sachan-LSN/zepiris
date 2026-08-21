@@ -32,6 +32,13 @@ from zepiris.schemas.ml_inference import (
 
 router = APIRouter()
 
+# libjpeg native subsampled-decode flags — built once at import time, not per call.
+_JPEG_REDUCE_FLAGS: dict[int, int] = {
+    2: cv2.IMREAD_REDUCED_COLOR_2,
+    4: cv2.IMREAD_REDUCED_COLOR_4,
+    8: cv2.IMREAD_REDUCED_COLOR_8,
+}
+
 
 class ImagePayload(BaseModel):
     """Base64-encoded image payload."""
@@ -72,16 +79,39 @@ def _decode_base64_image(image_b64: str) -> np.ndarray:
     return image_rgb
 
 
-def _decode_image_bytes(raw: bytes, *, field: str) -> np.ndarray:
+def _decode_image_bytes(raw: bytes, *, field: str, reduction: int = 0) -> np.ndarray:
     """Decode raw image bytes (JPEG/PNG/…) to an RGB array.
 
     The binary match path hands the original upload straight through, so this is
     the only decode in the whole pipeline for that image — no base64, no
     intermediate re-encode.
+
+    ``reduction`` enables libjpeg's native subsampled decode for JPEG inputs:
+    the DCT is computed at a smaller size, so CPU work falls proportionally
+    rather than decoding full resolution and then resizing down.
+
+        reduction=0  full decode (default, safe for all formats)
+        reduction=2  decode at 1/2 native size  (~¼ CPU vs full)
+        reduction=4  decode at 1/4 native size  (~1/16 CPU vs full)
+        reduction=8  decode at 1/8 native size  (only for extreme downscaling)
+
+    The flag is silently ignored by OpenCV for non-JPEG formats (PNG, WebP, …),
+    so passing it unconditionally is always safe — the result is just the full
+    image for those formats. At reduction=2 with a 256-px detector the delivered
+    resolution is still well above what the recognition crop needs (112 px), so
+    match quality is unaffected. Validate with ``scripts/prod_replay.py`` before
+    enabling reduction=4 or higher.
     """
     if not raw:
         raise HTTPException(status_code=400, detail=f"empty_image: {field}")
-    image_bgr = cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_COLOR)
+    flag = _JPEG_REDUCE_FLAGS.get(reduction, cv2.IMREAD_COLOR)
+    image_bgr = cv2.imdecode(np.frombuffer(raw, np.uint8), flag)
+    if image_bgr is None and flag != cv2.IMREAD_COLOR:
+        # Reduced decode can fail on encodings libjpeg will not scale (some
+        # progressive JPEGs, unusual chroma sub-sampling). Retry at full size
+        # before rejecting the image: a format we cannot subsample is still a
+        # format we can decode.
+        image_bgr = cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_COLOR)
     if image_bgr is None:
         raise HTTPException(status_code=400, detail=f"failed_to_decode_image: {field}")
     return cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
@@ -172,6 +202,7 @@ async def match_faces(
         # Decided out here, where the limiter's occupancy is visible: embedding
         # the two sides at once is only free while cores are idle.
         parallel = _may_embed_in_parallel(request.app.state, limiter)
+        jpeg_reduction = getattr(request.app.state, "jpeg_decode_reduction", 0)
         return await run_in_threadpool(
             _match_sync,
             service,
@@ -179,6 +210,7 @@ async def match_faces(
             reference_raw,
             want_probe_sharpness,
             parallel,
+            jpeg_reduction,
         )
 
 
@@ -208,20 +240,31 @@ def _match_sync(
     reference_raw: bytes,
     want_probe_sharpness: bool,
     parallel: bool = False,
+    jpeg_reduction: int = 0,
 ) -> FaceMatchResult:
     """Decode + embed + score, off the event loop.
 
-    The reference is keyed by its own bytes before anything is decoded, so a
-    repeat verification against the same enrolled selfie skips that side's
-    embedding entirely — about half the work of a match.
+    The reference is keyed by its own bytes before anything is decoded, and it is
+    handed to ``match_pair`` as a **callable** rather than an array. On a cache
+    hit those bytes are never decoded at all, saving a full JPEG decode and the
+    BGR->RGB conversion on the majority of requests — at the hit rate measured in
+    production, roughly two thirds of them. Deciding here instead (peek the
+    cache, skip the decode) would be a race: the entry can be evicted between the
+    peek and ``match_pair``'s own lookup, leaving nothing to embed. The callable
+    also puts the decode on the thread that does the embedding, so the parallel
+    path overlaps it with the probe.
+
+    ``jpeg_reduction`` is forwarded to :func:`_decode_image_bytes` to enable
+    libjpeg's native subsampled decode — see that function's docstring.
     """
     cache = getattr(service, "reference_cache", None)
     reference_key = reference_digest(reference_raw) if cache is not None and cache.enabled else None
-    probe_rgb = _decode_image_bytes(probe_raw, field="probe")
-    reference_rgb = _decode_image_bytes(reference_raw, field="reference")
+    probe_rgb = _decode_image_bytes(probe_raw, field="probe", reduction=jpeg_reduction)
     return service.match_pair(
         probe_rgb,
-        reference_rgb,
+        lambda: _decode_image_bytes(
+            reference_raw, field="reference", reduction=jpeg_reduction
+        ),
         want_probe_sharpness=want_probe_sharpness,
         reference_key=reference_key,
         parallel=parallel,

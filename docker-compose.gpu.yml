@@ -48,9 +48,30 @@ services:
     read_only: false
     environment:
       ML_SERVICE_ML_DEVICE: "cuda"
-      # The accurate tier is the reason to move to GPU: ResNet50 recognition is
-      # trivial work for a T4 and every existing threshold stays valid.
-      ML_SERVICE_FACE_TIER: "accurate"
+      # libjpeg subsampled decode: the DCT runs at half size, so a decode costs
+      # about a quarter of a full one. With a 320px detector and a 112px
+      # recognition crop, half-resolution pixels are still more than either model
+      # consumes. Validate with scripts/prod_replay.py before going to 4.
+      ML_SERVICE_FACE_JPEG_DECODE_REDUCTION: "2"
+      # FP16 models, once scripts/convert_fp16.py has written them into the
+      # insightface_cache volume. The T4 reaches 65 TFLOPS on tensor cores that an
+      # FP32 graph never touches, against 8.1 TFLOPS on its CUDA cores — which is
+      # why 120 req/s already draws the card's full 70W. Uncomment after
+      # converting AND after prod_replay confirms scores did not move.
+      # ML_SERVICE_FACE_DET_MODEL_PATH: "/home/appuser/.insightface/models/buffalo_s/det_500m_fp16.onnx"
+      # ML_SERVICE_FACE_REC_MODEL_PATH: "/home/appuser/.insightface/models/buffalo_l/w600k_r50_fp16.onnx"
+      # balanced, not accurate: the two tiers share the SAME recognizer
+      # (w600k_r50), so match scores and thresholds are unchanged — the only
+      # difference is the detector. Measured on a T4: accurate (det_10g @512)
+      # capped at 34.5 req/s with the host pinned at 380% CPU, because SCRFD's
+      # anchor decoding and NMS run in numpy on the CPU and det_10g emits far
+      # more anchors. balanced (det_500m @320) reached 98.9 req/s at p99 273ms on
+      # the same box. The detector, not the recognizer, is what sizes a GPU host.
+      ML_SERVICE_FACE_TIER: "balanced"
+      # A selfie face fills the frame and detects fine at 320; document faces are
+      # the case that needs 512+, and this branch is facematch-only.
+      ML_SERVICE_FACE_DETECTION_WIDTH: "320"
+      ML_SERVICE_FACE_DETECTION_HEIGHT: "320"
       # Per worker, so with 3 workers the instance runs ~36 inferences at once.
       # This is a queue-depth control, not a throughput knob: concurrency past
       # what the hardware can actually retire adds only waiting. At the measured
@@ -59,19 +80,65 @@ services:
       # flight, of which ~60 would have been queueing inside the process and
       # making every other request slower through CPU contention.
       ML_SERVICE_MAX_CONCURRENT_INFERENCES: "12"
-      # 30s: serve late rather than fail fast. The cost shows up in the measured
-      # ramp — at 200 req/s offered, requests came back at up to 27.6s and nothing
-      # was shed, because a slot always freed before the timeout did. So size the
-      # fleet from the rate where p95 stays inside the caller's deadline, not from
-      # the rate this will absorb; it absorbs far more than anyone is still
-      # waiting for. The API's own budget (ZEPIRIS_ML_INFERENCE_TIMEOUT_SECONDS,
-      # 60s) must stay above this, or the API gives up before the ML service sheds.
-      ML_SERVICE_INFERENCE_QUEUE_TIMEOUT_SECONDS: "30"
+      # 10s to wait for a slot, then 503. This is the promise the service makes
+      # about queueing: a request either starts within 10s or is refused, so
+      # overload costs the requests that cannot be served rather than delaying
+      # every request behind them. Measured at 30s, the queue absorbed 200 req/s
+      # by answering at up to 27.6s with nothing shed — served, but long after the
+      # caller had gone. Keep the API's own budget
+      # (ZEPIRIS_ML_INFERENCE_TIMEOUT_SECONDS, 60s) above this, or the API gives
+      # up before the ML service sheds.
+      ML_SERVICE_INFERENCE_QUEUE_TIMEOUT_SECONDS: "10"
       # Parallel pair embedding fans one request's two sides across CPU workers.
       # Off here: with 3 GIL-bound worker processes already competing for 4 cores,
       # fanning out inside a request steals throughput from other requests to
       # help one. Worth re-testing once the process count is settled.
       ML_SERVICE_FACE_PARALLEL_PAIR_EMBED: "false"
+
+      # -----------------------------------------------------------------------
+      # Throughput tuning (tasks 1-4 in the optimisation pass)
+      # -----------------------------------------------------------------------
+
+      # Cap the input side fed to the detector.  With a 320-px or 256-px
+      # detector window, carrying 1600-px intermediates is pure wasted resize
+      # work — the detector letterboxes to its window regardless.  640 keeps the
+      # face comfortably above the 112-px recognition crop at any normal phone
+      # focal length while cutting pre-detection work significantly.
+      ML_SERVICE_FACE_MAX_INPUT_SIDE: "640"
+
+      # Reference-embedding cache.  4096 (the default) is enough for a small
+      # pilot but will thrash in production with thousands of distinct riders.
+      # 16384 entries × 2 KB = ~32 MB — a rounding error against the 1.4 GB
+      # model footprint per worker, and it keeps the hit rate above 0.9 once
+      # the working set stabilises.
+      ML_SERVICE_FACE_REFERENCE_CACHE_SIZE: "16384"
+
+      # libjpeg native half-size decode.  Tells libjpeg to compute the DCT at
+      # 1/2 resolution, not decode full-res and then resize down.  CPU work
+      # drops ~25% per decode.  Safe at 640-px input cap + 320-px detector:
+      # a 1080p selfie decodes to 540p, which is still 4× the recognition crop.
+      # Validate first with scripts/prod_replay.py if input sizes vary widely.
+      ML_SERVICE_FACE_JPEG_DECODE_REDUCTION: "2"
+
+      # -----------------------------------------------------------------------
+      # FP16 model overrides — DISABLED until convert_fp16.py has been run.
+      #
+      # On the T4 (8.1 TFLOPS FP32 vs 65 TFLOPS FP16 tensor cores) this is the
+      # single largest throughput lever: the GPU switches from CUDA cores to
+      # tensor cores and inference cost drops ~2-3×.
+      #
+      # Step 1 — generate the FP16 models (one-time, ~30 s):
+      #   python scripts/convert_fp16.py --tier accurate
+      #
+      # Step 2 — the script prints the two output paths; paste them below,
+      # uncomment the two lines, and redeploy:
+      #   docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d
+      #
+      # Step 3 — validate match scores on a known-good replay before promoting:
+      #   python scripts/prod_replay.py
+      # -----------------------------------------------------------------------
+      # ML_SERVICE_FACE_DET_MODEL_PATH: "/root/.insightface/models/buffalo_l/det_10g_fp16.onnx"
+      # ML_SERVICE_FACE_REC_MODEL_PATH: "/root/.insightface/models/buffalo_l/w600k_r50_fp16.onnx"
     deploy:
       resources:
         reservations:

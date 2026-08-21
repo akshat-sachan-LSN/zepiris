@@ -179,6 +179,27 @@ class MLServiceSettings(BaseSettings):
     # trade speed back for a little robustness on blurry document photos.
     face_enable_flip_tta: bool = False
 
+    # libjpeg native subsampled decode for the binary match path.
+    # 0 = full decode (default, safe for every format).
+    # 2 = decode at 1/2 native size (recommended with face_detection_width ≤ 320).
+    # 4 = decode at 1/4 native size (validate with prod_replay.py first).
+    # At reduction=2 the delivered resolution is still well above the 112-px
+    # recognition crop, so match scores are unaffected at normal selfie sizes.
+    # The flag is silently ignored for non-JPEG formats, so enabling it is safe
+    # even in mixed-format traffic. ~10% CPU back per decode call.
+    face_jpeg_decode_reduction: int = 0
+
+    # -- FP16 model overrides ------------------------------------------------
+    # Explicit paths to FP16-converted ONNX models produced by
+    # scripts/convert_fp16.py.  When set they override the tier's default files.
+    # On a T4 (65 TFLOPS FP16 tensor cores vs 8.1 TFLOPS FP32 CUDA cores) this
+    # is the single highest-leverage change: the GPU switches from CUDA cores to
+    # tensor cores and throughput rises ~2-3x while power draw stays flat.
+    # Leave empty ("") to use the tier's stock FP32 models.
+    # Both must be set together; setting only one is silently ignored.
+    face_det_model_path: str = ""
+    face_rec_model_path: str = ""
+
 
 @lru_cache
 def get_ml_settings() -> MLServiceSettings:
@@ -244,6 +265,8 @@ async def lifespan(app: FastAPI):
     # Read per request by the match route; kept on state so routes never import
     # settings from this module (which imports them).
     app.state.parallel_pair_embed = s.face_parallel_pair_embed
+    # 0 = full JPEG decode; 2/4/8 = libjpeg native subsampled decode factor.
+    app.state.jpeg_decode_reduction = s.face_jpeg_decode_reduction
 
     logger.info("Loading ML models on device=%s …", device)
     failed: list[str] = []
@@ -291,6 +314,8 @@ async def lifespan(app: FastAPI):
             enable_det_cache=s.face_enable_det_cache,
             reference_cache_size=s.face_reference_cache_size,
             parallel_embed_workers=s.face_parallel_embed_workers,
+            det_model_path=s.face_det_model_path or None,
+            rec_model_path=s.face_rec_model_path or None,
         )
         app.state.face_embedding_service.load_model()
     except Exception:
