@@ -48,18 +48,6 @@ services:
     read_only: false
     environment:
       ML_SERVICE_ML_DEVICE: "cuda"
-      # libjpeg subsampled decode: the DCT runs at half size, so a decode costs
-      # about a quarter of a full one. With a 320px detector and a 112px
-      # recognition crop, half-resolution pixels are still more than either model
-      # consumes. Validate with scripts/prod_replay.py before going to 4.
-      ML_SERVICE_FACE_JPEG_DECODE_REDUCTION: "2"
-      # FP16 models, once scripts/convert_fp16.py has written them into the
-      # insightface_cache volume. The T4 reaches 65 TFLOPS on tensor cores that an
-      # FP32 graph never touches, against 8.1 TFLOPS on its CUDA cores — which is
-      # why 120 req/s already draws the card's full 70W. Uncomment after
-      # converting AND after prod_replay confirms scores did not move.
-      # ML_SERVICE_FACE_DET_MODEL_PATH: "/home/appuser/.insightface/models/buffalo_s/det_500m_fp16.onnx"
-      # ML_SERVICE_FACE_REC_MODEL_PATH: "/home/appuser/.insightface/models/buffalo_l/w600k_r50_fp16.onnx"
       # balanced, not accurate: the two tiers share the SAME recognizer
       # (w600k_r50), so match scores and thresholds are unchanged — the only
       # difference is the detector. Measured on a T4: accurate (det_10g @512)
@@ -127,18 +115,29 @@ services:
       # single largest throughput lever: the GPU switches from CUDA cores to
       # tensor cores and inference cost drops ~2-3×.
       #
-      # Step 1 — generate the FP16 models (one-time, ~30 s):
-      #   python scripts/convert_fp16.py --tier accurate
+      # Step 1 — generate the FP16 models into the mounted model volume. Convert
+      # the tier this overlay actually deploys (balanced = buffalo_s detector +
+      # buffalo_l recognizer), not the accurate tier's det_10g:
+      #   docker run --rm -v zepiris_insightface_cache:/home/appuser/.insightface \
+      #     -v ~/zepiris:/src -w /src --entrypoint bash zepiris-ml-inference \
+      #     -c "pip install -q onnxconverter-common && python scripts/convert_fp16.py"
       #
-      # Step 2 — the script prints the two output paths; paste them below,
-      # uncomment the two lines, and redeploy:
+      # Step 2 — uncomment the two lines below (they already name the paths the
+      # script writes for the balanced tier) and redeploy:
       #   docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d
       #
-      # Step 3 — validate match scores on a known-good replay before promoting:
-      #   python scripts/prod_replay.py
+      # Step 3 — validate before promoting. FP16 rounding near a 0.5 threshold is
+      # the only real risk, and prod_replay measures exactly that: |dscore| against
+      # the recorded scores, with no verdict allowed to flip.
+      #   python scripts/prod_replay.py --base-url http://<host>:8000 --rows 400
+      #
+      # Paths are under /home/appuser — the container runs as appuser and the
+      # volume is mounted on its home, so /root/.insightface does not exist here.
+      # A path that does not resolve makes the engine fall back to stock
+      # FaceAnalysis with only a warning, so a typo costs accuracy silently.
       # -----------------------------------------------------------------------
-      # ML_SERVICE_FACE_DET_MODEL_PATH: "/root/.insightface/models/buffalo_l/det_10g_fp16.onnx"
-      # ML_SERVICE_FACE_REC_MODEL_PATH: "/root/.insightface/models/buffalo_l/w600k_r50_fp16.onnx"
+      # ML_SERVICE_FACE_DET_MODEL_PATH: "/home/appuser/.insightface/models/buffalo_s/det_500m_fp16.onnx"
+      # ML_SERVICE_FACE_REC_MODEL_PATH: "/home/appuser/.insightface/models/buffalo_l/w600k_r50_fp16.onnx"
     deploy:
       resources:
         reservations:
