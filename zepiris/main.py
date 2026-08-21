@@ -7,6 +7,7 @@ import anyio.to_thread
 import httpx
 from fastapi import FastAPI
 
+from zepiris.api.concurrency import ApiConcurrencyLimiter, ConcurrencyLimitMiddleware
 from zepiris.api.routes import build_api_router
 from zepiris.config import get_settings
 from zepiris.exception_handlers import register_exception_handlers
@@ -74,7 +75,12 @@ async def lifespan(app: FastAPI):
         ),
         follow_redirects=True,
     )
-    s3_fetcher = S3ImageFetcher(client=fetch_client, max_bytes=settings.reference_max_bytes)
+    s3_fetcher = S3ImageFetcher(
+        client=fetch_client,
+        max_bytes=settings.reference_max_bytes,
+        cache_max_bytes=settings.s3_cache_max_bytes,
+        cache_ttl_seconds=settings.s3_cache_ttl_seconds,
+    )
 
     app.state.iqa = MLInferenceIQAService(ml_client)
     app.state.embedding = MLInferenceEmbeddingService(ml_client)
@@ -113,6 +119,16 @@ def create_app() -> FastAPI:
     )
     register_exception_handlers(app)
     app.include_router(build_api_router())
+
+    # Admission control: bound in-flight requests per worker, shed the rest as
+    # immediate 503s. Done here as ASGI middleware rather than uvicorn's
+    # limit_concurrency, which counts idle keep-alive *connections* and so
+    # sheds a healthy instance the moment enough clients merely hold
+    # connections open — see zepiris/api/concurrency.py.
+    if settings.api_limit_concurrency > 0:
+        limiter = ApiConcurrencyLimiter(settings.api_limit_concurrency)
+        app.state.api_limiter = limiter
+        app.add_middleware(ConcurrencyLimitMiddleware, limiter=limiter)
     return app
 
 
@@ -129,9 +145,9 @@ def run() -> None:
         port=settings.api_port,
         workers=settings.api_workers,
         access_log=settings.access_log,
-        # Refuse work past this many in-flight requests per worker rather than
-        # queueing it in the connection backlog, where it would wait with no
-        # timeout and no visibility. See api_limit_concurrency in config.py.
-        limit_concurrency=settings.api_limit_concurrency or None,
+        # In-flight admission control is NOT uvicorn's limit_concurrency — that
+        # counts idle keep-alive connections and refuses a healthy instance.
+        # It is the ASGI middleware wired in create_app(); see
+        # api_limit_concurrency in config.py and zepiris/api/concurrency.py.
         reload=False,
     )

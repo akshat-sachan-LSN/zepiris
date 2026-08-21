@@ -84,6 +84,10 @@ async def _record_outcome(learner, *, request_id: str, doc_type: str, body: dict
     behind one another's disk I/O — a global bottleneck on a path that is
     otherwise fully concurrent.
     """
+    if not learner.enabled:
+        # Disabled is the production default; skip the thread hop entirely
+        # rather than paying one per request to run a no-op.
+        return
     result = body.get("verificationResult") or {}
     score = result.get("score")
     if score is None:
@@ -144,7 +148,7 @@ async def _decode_b64_image(value: str, *, field: str) -> bytes:
 
 
 async def _resolve_image_source(
-    *, b64: str | None, s3_url: str | None, fetcher, field: str
+    *, b64: str | None, s3_url: str | None, fetcher, field: str, cacheable: bool = False
 ) -> bytes:
     """Resolve one image side (selfie or reference) to raw bytes.
 
@@ -154,6 +158,11 @@ async def _resolve_image_source(
 
     Whichever way the bytes arrive, they are passed through untouched — the
     matcher decodes them exactly once, wherever the models live.
+
+    ``cacheable`` marks a side whose URL returns the same bytes on every
+    request — the enrolled reference. Only that side may be served from the
+    fetcher's bytes cache; the probe is a fresh capture behind a fresh URL, so
+    caching it would only churn the budget.
     """
     has_b64 = bool(b64 and b64.strip())
     has_s3 = bool(s3_url and s3_url.strip())
@@ -162,7 +171,7 @@ async def _resolve_image_source(
     if has_b64:
         return await _decode_b64_image(b64, field=field)
     if has_s3:
-        raw = await fetcher.fetch(s3_url.strip())
+        raw = await fetcher.fetch(s3_url.strip(), cacheable=cacheable)
         _validate_image_bytes(raw)
         return raw
     raise ImageSourceError(field=field, reason="missing")
@@ -315,7 +324,7 @@ async def facematch_verify(
         ),
         reference_kwargs=dict(
             b64=req.source_selfie_b64, s3_url=req.source_selfie_s3, fetcher=fetcher,
-            field="source_selfie",
+            field="source_selfie", cacheable=True,
         ),
     )
     decision_threshold, threshold_source = _resolve_threshold(
@@ -363,7 +372,7 @@ async def docmatch_verify(
         ),
         reference_kwargs=dict(
             b64=req.source_selfie_b64, s3_url=req.source_selfie_s3, fetcher=fetcher,
-            field="source_selfie",
+            field="source_selfie", cacheable=True,
         ),
     )
     doc_kind = (req.doc_type or GENERIC_DOC_TYPE).strip().lower() or GENERIC_DOC_TYPE

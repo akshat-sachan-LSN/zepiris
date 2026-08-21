@@ -53,6 +53,17 @@ class Settings(BaseSettings):
     ml_max_connections: int = 200
     #: Connection-pool ceiling for reference-image fetches (two per request).
     s3_max_connections: int = 200
+    #: Byte budget for the in-process reference-bytes cache (0 = off). The
+    #: enrolled selfie is refetched from S3 on every verification even though
+    #: the ML service already holds its embedding; caching the bytes here
+    #: removes that GET — and S3's latency tail with it — for every repeat
+    #: verification. Safe because production reference URLs are content-unique
+    #: object keys; see services/s3_fetcher.py. 268435456 (256 MiB) holds
+    #: roughly 800 typical references.
+    s3_cache_max_bytes: int = 0
+    #: How long a cached reference body may be served before it is refetched.
+    #: A safety valve for overwritten keys, not a tuning knob.
+    s3_cache_ttl_seconds: float = 900.0
     #: Worker threads for the few remaining sync call sites. This process is
     #: I/O-bound — it fetches images and awaits the ML service — so it needs far
     #: fewer threads than it carries concurrent requests.
@@ -60,8 +71,12 @@ class Settings(BaseSettings):
     #: Uvicorn worker processes. The API is I/O-bound, so a couple of workers
     #: saturate a small instance; the CPU cost lives in the ML service.
     api_workers: int = 2
-    #: Admission control: in-flight requests **per worker** above which uvicorn
+    #: Admission control: in-flight requests **per worker** above which the API
     #: answers 503 immediately instead of accepting the work. 0 disables it.
+    #: Enforced by ASGI middleware (zepiris/api/concurrency.py), NOT uvicorn's
+    #: limit_concurrency — that knob counts idle keep-alive connections, so a
+    #: load balancer's warm pool or a few hundred connected clients trips it
+    #: while the box is doing nothing.
     #:
     #: This is the only place end-to-end latency can be bounded. The ML service's
     #: inference limiter sheds requests that reach its handler, but under real

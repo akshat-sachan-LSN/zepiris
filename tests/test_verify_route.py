@@ -87,12 +87,14 @@ class _Fetcher:
     def __init__(self, data: bytes) -> None:
         self._data = data
 
-    async def fetch(self, url: str) -> bytes:
+    async def fetch(self, url: str, *, cacheable: bool = False) -> bytes:
         return self._data
 
 
 class _Learner:
     """Stub adaptive learner: records calls, serves canned learned thresholds."""
+
+    enabled = True
 
     def __init__(self, learned: dict[str, float] | None = None) -> None:
         self._learned = learned or {}

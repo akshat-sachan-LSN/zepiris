@@ -32,8 +32,16 @@ class FrameError(ValueError):
 
 
 def encode_pair_frame(probe: bytes, reference: bytes) -> bytes:
-    """Pack two images into one request body."""
-    return _HEADER.pack(len(probe)) + probe + reference
+    """Pack two images into one request body.
+
+    ``join`` rather than ``a + b + c``: chained concatenation builds the
+    intermediate ``header + probe`` and then copies it again into the final
+    buffer, so a pair of 150 KB photos is copied roughly one and a half times
+    over. At 100 req/s that is tens of MB/s of pointless memcpy and garbage on a
+    host whose four cores are the scarce resource. ``join`` sizes the result once
+    and fills it in a single pass.
+    """
+    return b"".join((_HEADER.pack(len(probe)), probe, reference))
 
 
 def decode_pair_frame(body: bytes) -> tuple[bytes, bytes]:

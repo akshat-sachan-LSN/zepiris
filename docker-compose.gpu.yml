@@ -60,23 +60,28 @@ services:
       # the case that needs 512+, and this branch is facematch-only.
       ML_SERVICE_FACE_DETECTION_WIDTH: "320"
       ML_SERVICE_FACE_DETECTION_HEIGHT: "320"
-      # Per worker, so with 3 workers the instance runs ~36 inferences at once.
-      # This is a queue-depth control, not a throughput knob: concurrency past
-      # what the hardware can actually retire adds only waiting. At the measured
-      # ~35 req/s and ~1s service time, useful in-flight work is ~35 requests
-      # (Little's law) — 36 covers it, while the old 32-per-worker meant 96 in
-      # flight, of which ~60 would have been queueing inside the process and
-      # making every other request slower through CPU contention.
-      ML_SERVICE_MAX_CONCURRENT_INFERENCES: "12"
-      # 10s to wait for a slot, then 503. This is the promise the service makes
-      # about queueing: a request either starts within 10s or is refused, so
-      # overload costs the requests that cannot be served rather than delaying
-      # every request behind them. Measured at 30s, the queue absorbed 200 req/s
-      # by answering at up to 27.6s with nothing shed — served, but long after the
-      # caller had gone. Keep the API's own budget
-      # (ZEPIRIS_ML_INFERENCE_TIMEOUT_SECONDS, 60s) above this, or the API gives
-      # up before the ML service sheds.
-      ML_SERVICE_INFERENCE_QUEUE_TIMEOUT_SECONDS: "10"
+      # Per worker, so with 3 workers the instance runs up to 24 inferences at
+      # once. This is a queue-depth control, not a throughput knob: on GPU the
+      # per-request cost is almost all CPU-side (decode, letterbox, NMS), so an
+      # in-flight request is roughly a CPU-active thread, and 4 vCPUs cannot
+      # retire more than ~6-8 of those at once — everything past that is
+      # queueing *inside* the process, where it inflates every other request's
+      # latency through contention. Sizing by Little's law at the target: 150
+      # req/s x ~80 ms healthy service time = ~12 in flight; 24 is 2x margin
+      # for bursts. The old 12-per-worker (36 total) let a burst put 30+
+      # CPU-hungry threads on 4 cores, which is how service time stretched into
+      # seconds while the limiter never saw anything worth shedding.
+      ML_SERVICE_MAX_CONCURRENT_INFERENCES: "8"
+      # 2s to wait for a slot, then 503. This is the promise the service makes
+      # about queueing: in a ~100 ms system, a request that has already waited
+      # 2s is a lost cause for its caller — serving it late steals capacity
+      # from requests that could still be served on time. Measured at 30s, the
+      # queue absorbed 200 req/s by answering at up to 27.6s with nothing shed
+      # — served, but long after the caller had gone; at 10s the vegeta p99
+      # still ran 24s+ because the waiting simply happened before the limiter.
+      # Keep the API's own budget (ZEPIRIS_ML_INFERENCE_TIMEOUT_SECONDS, 60s)
+      # above this, or the API gives up before the ML service sheds.
+      ML_SERVICE_INFERENCE_QUEUE_TIMEOUT_SECONDS: "2"
       # Parallel pair embedding fans one request's two sides across CPU workers.
       # Off here: with 3 GIL-bound worker processes already competing for 4 cores,
       # fanning out inside a request steals throughput from other requests to
@@ -158,20 +163,44 @@ services:
 
   api:
     environment:
-      # Admission control: in-flight requests per worker above which uvicorn
-      # answers 503 at accept time instead of queueing. OFF (0) — the mechanism is
-      # wired and the setting works, but it has never been measured under real
-      # overload, and the one run that reached for it returned 1500 transport
-      # errors with nothing served. That failure looks like client-side socket
-      # exhaustion rather than the server refusing work, but "looks like" is not
-      # a measurement, and this is the newest untested thing in the path.
+      # Admission control: in-flight requests per worker above which the API
+      # answers 503 immediately instead of queueing. ON — this is the only
+      # knob that can bound end-to-end latency: the ML service's inference
+      # limiter sheds only what reaches its handler, and under overload the
+      # queue forms earlier, in the connection backlog, where nothing times
+      # out. Measured there twice: 150 req/s offered gave p95 13.9s with ZERO
+      # shed, and the on-box vegeta run at 100/s showed p99 24.4s with zero
+      # 503s — every slow request was waiting somewhere no limiter could see.
       #
-      # It is still the only knob that can bound end-to-end latency: the ML
-      # service's inference limiter sheds only what reaches its handler, and under
-      # overload the queue forms earlier, in the connection backlog, where nothing
-      # times out. Measured there: 150 req/s offered gave p95 13.9s with ZERO shed.
+      # Enforced by ASGI middleware counting in-flight REQUESTS
+      # (zepiris/api/concurrency.py), not uvicorn's limit_concurrency, which
+      # counts idle keep-alive connections — under vegeta's 400 persistent
+      # connections (or a fleet of connected phones) that knob sheds a healthy
+      # instance at idle, which is what the earlier attempt that "returned
+      # 1500 errors with nothing served" actually measured.
       #
-      # To enable, set 32 (32 x 2 workers = 64 in flight, capping queue delay near
-      # 64/130 = 0.5s at this box's measured rate) and confirm at 150 req/s that
-      # overflow arrives as clean 503s in the `shed` column, not as `err`.
-      ZEPIRIS_API_LIMIT_CONCURRENCY: "0"
+      # 40 x 2 workers = 80 in flight. Sized from the latency promise, not
+      # from capacity: at ~150 req/s throughput, 80 in flight bounds queue
+      # delay near 80/150 = 0.53s, while a healthy 150 req/s load carries ~45
+      # in flight (S3 fetch + ML call, ~0.3s worst) — so nothing is shed until
+      # the box is genuinely past what it can serve, and overflow arrives as
+      # clean, fast 503s instead of 24-second zombies. Watch it at
+      # GET /metrics -> admission.shed_total.
+      ZEPIRIS_API_LIMIT_CONCURRENCY: "40"
+
+      # The enrolled selfie's bytes, cached in-process by URL (256 MiB budget,
+      # ~800 references). Production reference URLs are content-unique S3 keys,
+      # so the same URL cannot start serving different pixels; the 15-min TTL
+      # (config default) is the safety valve, not a tuning knob. This removes
+      # one of the two S3 GETs per request — and S3's latency tail with it —
+      # for every repeat verification, the same traffic shape that gives the ML
+      # service's embedding cache its ~2/3 hit rate. Watch it at
+      # GET /metrics -> reference_bytes_cache.hit_rate during a load run.
+      ZEPIRIS_S3_CACHE_MAX_BYTES: "268435456"
+
+      # An S3 GET that has not answered in 5s is not going to make the request:
+      # at 10s (the old default) a hung fetch held an admission slot for the
+      # full window, and 80 slots x slow-S3 excursions is how a blip upstream
+      # turns into shedding healthy requests. S3 GET p99 in-region is far
+      # below this; the timeout exists for the pathological connection.
+      ZEPIRIS_REFERENCE_FETCH_TIMEOUT_SECONDS: "5"

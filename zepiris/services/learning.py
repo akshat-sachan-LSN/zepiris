@@ -74,6 +74,12 @@ class AdaptiveThresholdLearner:
         self._thresholds_path = self._dir / "thresholds.json"
         self._thresholds: dict[str, dict] = self._load_thresholds()
 
+    @property
+    def enabled(self) -> bool:
+        """Whether recording does anything — lets the request path skip the
+        thread hop that would otherwise be paid just to run a no-op."""
+        return self._enabled
+
     # -- recording ----------------------------------------------------------
 
     def record_sample(

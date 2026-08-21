@@ -198,9 +198,30 @@ async def run(args: argparse.Namespace) -> int:
     print(f"  {len({e['reference'] for e in events})} distinct enrolled selfies")
 
     url = f"{args.base_url.rstrip('/')}/v1/faces/facematch/verify"
+
+    # Give the process every file descriptor it is allowed, since each in-flight
+    # request holds a socket. Without this, macOS's default soft limit of 256
+    # turns a high-rate run into a wall of transport errors that look like server
+    # failures — the run reports 0 served and every request errored.
+    _raise_fd_limit()
+
     # The pool has to be able to hold a full batch in flight at once, or the
-    # generator would throttle itself and measure its own queue instead.
-    pool = max(rates) * int(args.seconds) + 64
+    # generator throttles itself and measures its own queue instead. But that
+    # product is rate x duration: a 130 req/s run for 100s asks for 13,064
+    # sockets, which no single client sustains. Past --max-inflight the run stops
+    # being a measurement of the service, so cap it and say so rather than
+    # producing a number that looks real.
+    wanted = max(rates) * int(args.seconds) + 64
+    pool = min(wanted, args.max_inflight)
+    if wanted > args.max_inflight:
+        print(
+            f"  note: {max(rates)}/s for {args.seconds}s would need {wanted} sockets; "
+            f"capping the pool at {args.max_inflight}.\n"
+            f"  A long window at a high rate cannot be offered from one client — use "
+            f"--seconds 10 and repeat,\n  or generate load on the server itself. Watch "
+            f"for the 'fell behind schedule' note below: if it appears, the row "
+            f"describes this client, not the service."
+        )
     limits = httpx.Limits(max_connections=pool, max_keepalive_connections=pool)
 
     rows: list[dict] = []
@@ -244,6 +265,25 @@ async def run(args: argparse.Namespace) -> int:
     return 0
 
 
+def _raise_fd_limit() -> None:
+    """Raise this process's open-file soft limit to its hard limit.
+
+    Every in-flight request holds a socket, so the soft limit is a ceiling on
+    concurrency. macOS ships 256, which a 100 req/s run exhausts in under three
+    seconds — and the failure surfaces as transport errors indistinguishable from
+    the server refusing connections.
+    """
+    try:
+        import resource
+
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        if soft < hard:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (hard, hard))
+            print(f"  raised open-file limit {soft} -> {hard}")
+    except (ImportError, ValueError, OSError) as exc:
+        print(f"  note: could not raise the open-file limit ({exc}); run `ulimit -n 10240`")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -255,6 +295,16 @@ def main() -> int:
     ap.add_argument("--rows", type=int, default=400, help="Events to draw from (cycled)")
     ap.add_argument("--timeout", type=float, default=45.0)
     ap.add_argument("--settle", type=float, default=6.0, help="Drain gap between rates")
+    ap.add_argument(
+        "--max-inflight",
+        type=int,
+        default=2048,
+        help=(
+            "Ceiling on concurrent connections. The pool would otherwise be "
+            "rate x seconds, which a long high-rate run cannot sustain from one "
+            "client (default: 2048)"
+        ),
+    )
     ap.add_argument("--per-request", help="CSV of every request, tagged with its rate")
     ap.add_argument("--save", help="Write the per-batch summary here as JSON")
     return asyncio.run(run(ap.parse_args()))
