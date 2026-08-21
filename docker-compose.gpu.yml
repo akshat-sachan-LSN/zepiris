@@ -158,16 +158,20 @@ services:
 
   api:
     environment:
-      # Admission control, and the only place end-to-end latency can be bounded.
-      # 32 per worker x 2 workers = 64 in flight; at the ~120 req/s this box
-      # serves, that caps queue delay near 64/120 = 0.5s, and anything past it
-      # gets an immediate 503 instead of a slow 200.
+      # Admission control: in-flight requests per worker above which uvicorn
+      # answers 503 at accept time instead of queueing. OFF (0) — the mechanism is
+      # wired and the setting works, but it has never been measured under real
+      # overload, and the one run that reached for it returned 1500 transport
+      # errors with nothing served. That failure looks like client-side socket
+      # exhaustion rather than the server refusing work, but "looks like" is not
+      # a measurement, and this is the newest untested thing in the path.
       #
-      # Measured without it: 150 req/s offered produced p95 13.9s with ZERO shed
-      # at a 10s inference timeout, and p95 14s with zero shed at a 1s timeout —
-      # the inference limiter only sheds what reaches its handler, and under
-      # overload the queue forms earlier, in the connection backlog.
+      # It is still the only knob that can bound end-to-end latency: the ML
+      # service's inference limiter sheds only what reaches its handler, and under
+      # overload the queue forms earlier, in the connection backlog, where nothing
+      # times out. Measured there: 150 req/s offered gave p95 13.9s with ZERO shed.
       #
-      # A healthy load here carries ~16 in flight (117 req/s x 138ms), so 64
-      # leaves burst headroom without letting a backlog build.
-      ZEPIRIS_API_LIMIT_CONCURRENCY: "32"
+      # To enable, set 32 (32 x 2 workers = 64 in flight, capping queue delay near
+      # 64/130 = 0.5s at this box's measured rate) and confirm at 150 req/s that
+      # overflow arrives as clean 503s in the `shed` column, not as `err`.
+      ZEPIRIS_API_LIMIT_CONCURRENCY: "0"
