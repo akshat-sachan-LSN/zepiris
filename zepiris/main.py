@@ -129,5 +129,9 @@ def run() -> None:
         port=settings.api_port,
         workers=settings.api_workers,
         access_log=settings.access_log,
+        # Refuse work past this many in-flight requests per worker rather than
+        # queueing it in the connection backlog, where it would wait with no
+        # timeout and no visibility. See api_limit_concurrency in config.py.
+        limit_concurrency=settings.api_limit_concurrency or None,
         reload=False,
     )

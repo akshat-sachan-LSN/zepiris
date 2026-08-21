@@ -60,6 +60,23 @@ class Settings(BaseSettings):
     #: Uvicorn worker processes. The API is I/O-bound, so a couple of workers
     #: saturate a small instance; the CPU cost lives in the ML service.
     api_workers: int = 2
+    #: Admission control: in-flight requests **per worker** above which uvicorn
+    #: answers 503 immediately instead of accepting the work. 0 disables it.
+    #:
+    #: This is the only place end-to-end latency can be bounded. The ML service's
+    #: inference limiter sheds requests that reach its handler, but under real
+    #: overload the queue forms earlier — in the connection backlog, where nothing
+    #: times out. Measured: with the inference queue timeout cut to 1s, sheds fell
+    #: to zero while p95 rose to 14s, because the waiting had simply moved
+    #: upstream of the thing doing the shedding.
+    #:
+    #: Size it from the latency you will accept, not from capacity: queue delay is
+    #: in-flight / throughput, so at ~120 req/s a limit of 32 per worker across 2
+    #: workers bounds the wait at roughly 64/120 = 0.5s. Set it too high and it
+    #: stops being admission control; set it below the in-flight count a healthy
+    #: load carries (throughput x latency, ~16 requests here) and it sheds traffic
+    #: the service could have served.
+    api_limit_concurrency: int = 0
     #: Per-request access logging. One line per request is a rounding error at
     #: 10 req/s and roughly 13 GB/day at 1000 — and it duplicates what the load
     #: balancer already records, with none of its retention controls. Off by

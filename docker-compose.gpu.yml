@@ -87,12 +87,11 @@ services:
       # Throughput tuning (tasks 1-4 in the optimisation pass)
       # -----------------------------------------------------------------------
 
-      # Cap the input side fed to the detector.  With a 320-px or 256-px
-      # detector window, carrying 1600-px intermediates is pure wasted resize
-      # work — the detector letterboxes to its window regardless.  640 keeps the
-      # face comfortably above the 112-px recognition crop at any normal phone
-      # focal length while cutting pre-detection work significantly.
-      ML_SERVICE_FACE_MAX_INPUT_SIDE: "640"
+      # Downscale ceiling before detection. 1600 is the value the 98.9 req/s and
+      # 117 req/s runs were measured at. 640 looked free — the detector letterboxes
+      # to 320 anyway — but combined with subsampled decode it cost more than half
+      # the throughput (see the decode note above). Left where the measurements are.
+      ML_SERVICE_FACE_MAX_INPUT_SIDE: "1600"
 
       # Reference-embedding cache.  4096 (the default) is enough for a small
       # pilot but will thrash in production with thousands of distinct riders.
@@ -101,12 +100,23 @@ services:
       # the working set stabilises.
       ML_SERVICE_FACE_REFERENCE_CACHE_SIZE: "16384"
 
-      # libjpeg native half-size decode.  Tells libjpeg to compute the DCT at
-      # 1/2 resolution, not decode full-res and then resize down.  CPU work
-      # drops ~25% per decode.  Safe at 640-px input cap + 320-px detector:
-      # a 1080p selfie decodes to 540p, which is still 4× the recognition crop.
-      # Validate first with scripts/prod_replay.py if input sizes vary widely.
-      ML_SERVICE_FACE_JPEG_DECODE_REDUCTION: "2"
+      # libjpeg subsampled decode. OFF (0) — measured a regression, not a win.
+      #
+      # In theory a half-size DCT costs a quarter of the CPU and 320px detection
+      # cannot tell the difference. Measured on this box, reduction=2 together
+      # with MAX_INPUT_SIDE=640 took 110 req/s from 107.4 served at p50 113ms
+      # down to 71.9 served at p50 1677ms, with latency variance exploding.
+      #
+      # The likely mechanism is the detector's fallback cascade: cutting pixel
+      # area ~4x makes some faces miss on the first pass, and a miss costs a
+      # lower-threshold retry plus a 2x upscale retry — each a full extra
+      # detection pass. Cheaper pixels are worthless if they turn a one-pass
+      # request into a three-pass one.
+      #
+      # Re-testing it means changing this alone (leave MAX_INPUT_SIDE at 1600),
+      # and checking scripts/prod_replay.py for faces that stopped being found —
+      # not just the throughput number.
+      ML_SERVICE_FACE_JPEG_DECODE_REDUCTION: "0"
 
       # -----------------------------------------------------------------------
       # FP16 model overrides — DISABLED until convert_fp16.py has been run.
@@ -145,3 +155,19 @@ services:
             - driver: nvidia
               count: 1
               capabilities: [gpu]
+
+  api:
+    environment:
+      # Admission control, and the only place end-to-end latency can be bounded.
+      # 32 per worker x 2 workers = 64 in flight; at the ~120 req/s this box
+      # serves, that caps queue delay near 64/120 = 0.5s, and anything past it
+      # gets an immediate 503 instead of a slow 200.
+      #
+      # Measured without it: 150 req/s offered produced p95 13.9s with ZERO shed
+      # at a 10s inference timeout, and p95 14s with zero shed at a 1s timeout —
+      # the inference limiter only sheds what reaches its handler, and under
+      # overload the queue forms earlier, in the connection backlog.
+      #
+      # A healthy load here carries ~16 in flight (117 req/s x 138ms), so 64
+      # leaves burst headroom without letting a backlog build.
+      ZEPIRIS_API_LIMIT_CONCURRENCY: "32"
